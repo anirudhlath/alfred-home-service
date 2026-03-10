@@ -7,6 +7,12 @@ The home-service works independently without it.
 from __future__ import annotations
 
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
 from alfred_sdk import AlfredClient
 
 from app.ha_client import HomeAssistantClient
@@ -18,19 +24,25 @@ ha = HomeAssistantClient(
 
 client = AlfredClient(
     service_name="home-service",
-    service_endpoint=f"http://{os.getenv('HOSTNAME', 'home-service')}:8000/mcp",
+    service_endpoint=f"http://{os.getenv('SERVICE_HOST', 'localhost')}:8000/mcp",
 )
 
 
-@client.tool(name="smart_home.dim_lights", description="Dim lights in a room to a level (0-100)")
+@client.tool(
+    name="smart_home.dim_lights", description="Dim lights in a room to a level (0-100)"
+)
 async def dim_lights(room: str, level: int) -> dict:
     entity_id = f"light.{room}"
     brightness = int(level * 2.55)  # Convert 0-100 to 0-255
-    await ha.call_service("light", "turn_on", {"entity_id": entity_id, "brightness": brightness})
+    await ha.call_service(
+        "light", "turn_on", {"entity_id": entity_id, "brightness": brightness}
+    )
     return {"entity_id": entity_id, "brightness": level}
 
 
-@client.tool(name="smart_home.turn_off_lights", description="Turn off all lights in a room")
+@client.tool(
+    name="smart_home.turn_off_lights", description="Turn off all lights in a room"
+)
 async def turn_off_lights(room: str) -> dict:
     entity_id = f"light.{room}"
     await ha.call_service("light", "turn_off", {"entity_id": entity_id})
