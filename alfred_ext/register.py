@@ -22,15 +22,21 @@ client = AlfredClient(
 )
 
 
-@client.tool(name="smart_home.dim_lights", description="Dim lights in a room to a level (0-100)")
+@client.tool(
+    name="smart_home.dim_lights", description="Dim lights in a room to a level (0-100)"
+)
 async def dim_lights(room: str, level: int) -> dict:
     entity_id = f"light.{room}"
     brightness = int(level * 2.55)  # Convert 0-100 to 0-255
-    await ha.call_service("light", "turn_on", {"entity_id": entity_id, "brightness": brightness})
+    await ha.call_service(
+        "light", "turn_on", {"entity_id": entity_id, "brightness": brightness}
+    )
     return {"entity_id": entity_id, "brightness": level}
 
 
-@client.tool(name="smart_home.turn_off_lights", description="Turn off all lights in a room")
+@client.tool(
+    name="smart_home.turn_off_lights", description="Turn off all lights in a room"
+)
 async def turn_off_lights(room: str) -> dict:
     entity_id = f"light.{room}"
     await ha.call_service("light", "turn_off", {"entity_id": entity_id})

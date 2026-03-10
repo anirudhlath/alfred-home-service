@@ -11,7 +11,11 @@ async def test_get_states_returns_entities():
     mock_response = AsyncMock()
     mock_response.json = MagicMock(
         return_value=[
-            {"entity_id": "light.living_room", "state": "on", "attributes": {"brightness": 255}},
+            {
+                "entity_id": "light.living_room",
+                "state": "on",
+                "attributes": {"brightness": 255},
+            },
             {"entity_id": "media_player.tv", "state": "playing", "attributes": {}},
         ]
     )
@@ -34,7 +38,9 @@ async def test_call_service_sends_request():
 
     with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
         client = HomeAssistantClient(host="http://fake:8123", token="fake-token")
-        await client.call_service("light", "turn_on", {"entity_id": "light.living_room", "brightness": 50})
+        await client.call_service(
+            "light", "turn_on", {"entity_id": "light.living_room", "brightness": 50}
+        )
 
         mock_post.assert_called_once()
         call_args = mock_post.call_args
