@@ -34,16 +34,22 @@ class McpResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # type: ignore[type-arg]
-    """Register tools with Alfred on startup."""
+    """Register tools with Alfred on startup, unregister on shutdown."""
     try:
         from alfred_ext.register import client
 
         await client.register()
         logger.info("Registered tools with Alfred registry")
     except Exception as e:
-        # Registration failure is non-fatal — Alfred may not be running yet
         logger.warning("Could not register with Alfred: %s", e)
     yield
+    try:
+        from alfred_ext.register import client
+
+        await client.unregister()
+        logger.info("Unregistered from Alfred registry")
+    except Exception as e:
+        logger.warning("Could not unregister from Alfred: %s", e)
 
 
 app = FastAPI(title="home-service", lifespan=lifespan)

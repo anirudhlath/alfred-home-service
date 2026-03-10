@@ -28,29 +28,16 @@ client = AlfredClient(
 )
 
 
-@client.tool(
-    name="smart_home.dim_lights", description="Dim lights in a room to a level (0-100)"
+class HomeServiceContext:
+    """Shared dependencies for all home-service features."""
+
+    def __init__(self, ha: HomeAssistantClient) -> None:
+        self.ha = ha
+
+
+import alfred_ext.features as features_pkg
+
+client.discover_features(
+    package=features_pkg,
+    ctx=HomeServiceContext(ha=ha),
 )
-async def dim_lights(room: str, level: int) -> dict:
-    entity_id = f"light.{room}"
-    brightness = int(level * 2.55)  # Convert 0-100 to 0-255
-    await ha.call_service(
-        "light", "turn_on", {"entity_id": entity_id, "brightness": brightness}
-    )
-    return {"entity_id": entity_id, "brightness": level}
-
-
-@client.tool(
-    name="smart_home.turn_off_lights", description="Turn off all lights in a room"
-)
-async def turn_off_lights(room: str) -> dict:
-    entity_id = f"light.{room}"
-    await ha.call_service("light", "turn_off", {"entity_id": entity_id})
-    return {"entity_id": entity_id, "state": "off"}
-
-
-@client.tool(name="smart_home.set_scene", description="Activate a Home Assistant scene")
-async def set_scene(scene_name: str) -> dict:
-    entity_id = f"scene.{scene_name}"
-    await ha.call_service("scene", "turn_on", {"entity_id": entity_id})
-    return {"scene": scene_name, "activated": True}
