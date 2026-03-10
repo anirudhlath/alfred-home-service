@@ -7,6 +7,12 @@ The home-service works independently without it.
 from __future__ import annotations
 
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
 from alfred_sdk import AlfredClient
 
 from app.ha_client import HomeAssistantClient
@@ -18,7 +24,7 @@ ha = HomeAssistantClient(
 
 client = AlfredClient(
     service_name="home-service",
-    service_endpoint=f"http://{os.getenv('HOSTNAME', 'home-service')}:8000/mcp",
+    service_endpoint=f"http://{os.getenv('SERVICE_HOST', 'localhost')}:8000/mcp",
 )
 
 

@@ -63,8 +63,9 @@ async def mcp_endpoint(request: McpRequest) -> McpResponse:
     except KeyError as e:
         return McpResponse(id=request.id, error=str(e))
     except Exception as e:
-        logger.error("Tool execution failed: %s", e)
-        return McpResponse(id=request.id, error=str(e))
+        error_msg = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+        logger.error("Tool execution failed: %s", error_msg)
+        return McpResponse(id=request.id, error=error_msg)
 
 
 @app.get("/health")
