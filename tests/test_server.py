@@ -19,7 +19,7 @@ async def test_mcp_endpoint_dispatches_tool_call() -> None:
             resp = await client.post(
                 "/mcp",
                 json={
-                    "method": "smart_home.dim_lights",
+                    "method": "lighting.dim_lights",
                     "params": {"room": "living_room", "level": 20},
                     "id": "req-001",
                 },
