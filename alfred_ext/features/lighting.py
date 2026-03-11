@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 from alfred_sdk import BaseFeature, tool
-from alfred_sdk.context import ContextEntry, ContextSnapshot
+from alfred_sdk.context import ContextSnapshot
 
-logger = logging.getLogger(__name__)
+from alfred_ext.ha_utils import context_for_domain, to_entity_id
 
 
 class LightingFeature(BaseFeature):
@@ -22,21 +21,7 @@ class LightingFeature(BaseFeature):
 
     async def get_context(self) -> ContextSnapshot:
         """Return current state of all light entities from HA."""
-        try:
-            states = await self.ha.get_states()
-            entries = [
-                ContextEntry(
-                    entity_id=s["entity_id"],
-                    state=s.get("state", "unknown"),
-                    attributes=s.get("attributes", {}),
-                )
-                for s in states
-                if s["entity_id"].startswith("light.")
-            ]
-            return ContextSnapshot(controllable={"light": entries})
-        except Exception as e:
-            logger.warning("Could not query HA for light context: %s", e)
-            return ContextSnapshot()
+        return await context_for_domain(self.ha, "light")
 
     @tool
     async def dim_lights(self, room: str, level: int) -> dict[str, Any]:
@@ -46,7 +31,7 @@ class LightingFeature(BaseFeature):
             room: The room name.
             level: Brightness level 0-100.
         """
-        entity_id = f"light.{room.replace(' ', '_').lower()}"
+        entity_id = to_entity_id("light", room)
         brightness = int(level * 2.55)  # Convert 0-100 to 0-255
         await self.ha.call_service(
             "light", "turn_on", {"entity_id": entity_id, "brightness": brightness}
@@ -60,6 +45,6 @@ class LightingFeature(BaseFeature):
         Args:
             room: The room name.
         """
-        entity_id = f"light.{room.replace(' ', '_').lower()}"
+        entity_id = to_entity_id("light", room)
         await self.ha.call_service("light", "turn_off", {"entity_id": entity_id})
         return {"entity_id": entity_id, "state": "off"}
