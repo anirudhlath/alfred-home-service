@@ -6,6 +6,7 @@ to registered tool handlers via AlfredClient.dispatch().
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import Any
@@ -14,6 +15,8 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
+
+ENTITY_REFRESH_INTERVAL = 300.0  # 5 minutes
 
 
 class McpRequest(BaseModel):
@@ -34,15 +37,30 @@ class McpResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # type: ignore[type-arg]
-    """Register tools with Alfred on startup, unregister on shutdown."""
+    """Register tools and context with Alfred on startup, unregister on shutdown."""
+    refresh_task: asyncio.Task[None] | None = None
     try:
         from alfred_ext.register import client
 
         await client.register()
-        logger.info("Registered tools with Alfred registry")
+        logger.info("Registered tools and context with Alfred registry")
+
+        async def _refresh_loop() -> None:
+            """Re-register periodically (refreshes tools + context)."""
+            while True:
+                await asyncio.sleep(ENTITY_REFRESH_INTERVAL)
+                try:
+                    await client.register()
+                    logger.debug("Refreshed tool registry and context")
+                except Exception as e:
+                    logger.warning("Registration refresh failed: %s", e)
+
+        refresh_task = asyncio.create_task(_refresh_loop())
     except Exception as e:
         logger.warning("Could not register with Alfred: %s", e)
     yield
+    if refresh_task is not None:
+        refresh_task.cancel()
     try:
         from alfred_ext.register import client
 
