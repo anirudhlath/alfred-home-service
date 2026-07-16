@@ -19,9 +19,14 @@ class HomeAssistantClient:
         self._client: httpx.AsyncClient | None = None
 
     def _get_client(self) -> httpx.AsyncClient:
-        """Get or create the shared httpx client."""
+        """Get or create the shared httpx client.
+
+        Timeouts are deliberately short: Alfred's HomeAgent gives up at 30s,
+        so an unreachable HA (down, or a dead port-forward that accepts and
+        stalls) must produce a structured error here well before that.
+        """
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=30.0)
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0))
         return self._client
 
     async def get_states(self) -> list[dict[str, Any]]:
