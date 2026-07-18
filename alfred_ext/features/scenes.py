@@ -10,7 +10,7 @@ from alfred_sdk.context import ContextSnapshot
 from alfred_ext.ha_utils import context_for_domain, to_entity_id
 
 
-class SceneFeature(BaseFeature):
+class SceneFeature(BaseFeature):  # type: ignore[misc] # alfred-sdk has no py.typed yet
     """Smart home scene management."""
 
     feature_name = "scenes"
@@ -23,7 +23,7 @@ class SceneFeature(BaseFeature):
         """Return current state of all scene entities from HA."""
         return await context_for_domain(self.ha, "scene")
 
-    @tool
+    @tool  # type: ignore[untyped-decorator] # alfred-sdk has no py.typed yet
     async def set_scene(self, scene_name: str) -> dict[str, Any]:
         """Activate a Home Assistant scene.
 

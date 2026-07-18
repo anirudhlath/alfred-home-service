@@ -12,11 +12,13 @@ dependencies = [
 
 [project.optional-dependencies]
 alfred = [
-    "alfred-sdk>=0.1.0",
+    "alfred-sdk @ git+https://github.com/anirudhlath/alfred@v0.1.0#subdirectory=sdk",
 ]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "ruff>=0.15.16",
+    "mypy>=2.1",
 ]
 
 [tool.setuptools.packages.find]
@@ -24,3 +26,22 @@ include = ["app*", "alfred_ext*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+
+# alfred-sdk ships no `py.typed` marker (tracked upstream in alfred/sdk), so its exports
+# resolve to `Any` and mypy can't see into it. This override ONLY suppresses the
+# import-untyped noise for that third-party package. alfred_ext/ is first-party code in
+# this repo and is fully mypy --strict checked (see targeted `type: ignore[misc]`/
+# `[untyped-decorator]` comments where BaseFeature's `Any` type leaks in). Remove this
+# override once alfred-sdk ships a `py.typed` marker.
+[[tool.mypy.overrides]]
+module = ["alfred_sdk.*"]
+ignore_missing_imports = true
+follow_imports = "skip"

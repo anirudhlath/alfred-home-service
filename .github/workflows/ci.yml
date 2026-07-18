@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  python:
+    uses: anirudhlath/alfred/.github/workflows/python-ci.yml@master
+    with:
+      mypy-targets: "app/ alfred_ext/"
+      sync-args: "--all-extras"
+
+  pr-title:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate conventional PR title
+        if: github.event_name == 'pull_request'
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if ! printf '%s' "$TITLE" | grep -qE '^(feat|fix|chore|docs|refactor|test|ci|perf)(\([a-zA-Z0-9._/ -]+\))?!?: .+$'; then
+            echo "::error::PR title must be a conventional commit line"; exit 1
+          fi
+      - name: Not a PR
+        if: github.event_name != 'pull_request'
+        run: echo "push event"
+
+  ci-ok:
+    if: always()
+    needs: [python, pr-title]
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS"
+          if echo "$RESULTS" | grep -Eq '"result": "(failure|cancelled|skipped)"'; then exit 1; fi
