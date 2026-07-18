@@ -52,8 +52,6 @@ class HomeAssistantClient:
     async def get_entity_state(self, entity_id: str) -> dict[str, Any]:
         """Get state of a single entity."""
         client = self._get_client()
-        resp = await client.get(
-            f"{self.host}/api/states/{entity_id}", headers=self.headers
-        )
+        resp = await client.get(f"{self.host}/api/states/{entity_id}", headers=self.headers)
         resp.raise_for_status()
         return resp.json()  # type: ignore[no-any-return]

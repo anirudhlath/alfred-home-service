@@ -11,11 +11,11 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
-
+import alfred_ext.features as features_pkg
 from alfred_sdk import AlfredClient
-
 from app.ha_client import HomeAssistantClient
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 ha = HomeAssistantClient(
     host=os.getenv("HA_HOST", "http://homeassistant.local:8123"),
@@ -34,8 +34,6 @@ class HomeServiceContext:
     def __init__(self, ha: HomeAssistantClient) -> None:
         self.ha = ha
 
-
-import alfred_ext.features as features_pkg
 
 client.discover_features(
     package=features_pkg,

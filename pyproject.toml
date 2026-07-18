@@ -12,7 +12,7 @@ dependencies = [
 
 [project.optional-dependencies]
 alfred = [
-    "alfred-sdk>=0.1.0",
+    "alfred-sdk @ git+https://github.com/anirudhlath/alfred@v0.1.0#subdirectory=sdk",
 ]
 dev = [
     "pytest>=8.0",
@@ -24,3 +24,20 @@ include = ["app*", "alfred_ext*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+
+# alfred-sdk ships no `py.typed` marker (tracked upstream in alfred/sdk), so its exports
+# resolve to `Any`. alfred_ext/ is the optional Alfred-integration layer that depends on
+# it; skip following into it so app/ (the sovereign core) stays fully mypy --strict clean
+# without those upstream-typing errors leaking in. Re-include once alfred-sdk is typed.
+[[tool.mypy.overrides]]
+module = ["alfred_ext.*", "alfred_sdk.*"]
+ignore_missing_imports = true
+follow_imports = "skip"

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -36,7 +37,7 @@ class McpResponse(BaseModel):
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):  # type: ignore[type-arg]
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Register tools and context with Alfred on startup, unregister on shutdown."""
     refresh_task: asyncio.Task[None] | None = None
     try:
