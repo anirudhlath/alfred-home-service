@@ -1,0 +1,27 @@
+name: release-please
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    # Dormant until BOT_APP_ID/BOT_APP_PRIVATE_KEY are configured — runs skip, stay green.
+    env:
+      HAS_BOT_APP: ${{ secrets.BOT_APP_ID != '' }}
+    steps:
+      # Bot App token, not GITHUB_TOKEN: tags/Releases created with GITHUB_TOKEN can
+      # never trigger downstream workflows (deploy hooks etc.).
+      - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        if: env.HAS_BOT_APP == 'true'
+        id: app
+        with:
+          app-id: ${{ secrets.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
+        if: env.HAS_BOT_APP == 'true'
+        with:
+          token: ${{ steps.app.outputs.token }}
