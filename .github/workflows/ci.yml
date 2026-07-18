@@ -17,7 +17,7 @@ jobs:
   python:
     uses: anirudhlath/alfred/.github/workflows/python-ci.yml@master
     with:
-      mypy-targets: "app/"
+      mypy-targets: "app/ alfred_ext/"
       sync-args: "--all-extras"
 
   pr-title:

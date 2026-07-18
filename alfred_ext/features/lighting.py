@@ -10,7 +10,7 @@ from alfred_sdk.context import ContextSnapshot
 from alfred_ext.ha_utils import context_for_domain, to_entity_id
 
 
-class LightingFeature(BaseFeature):
+class LightingFeature(BaseFeature):  # type: ignore[misc] # alfred-sdk has no py.typed yet
     """Smart home lighting controls."""
 
     feature_name = "lighting"
@@ -23,7 +23,7 @@ class LightingFeature(BaseFeature):
         """Return current state of all light entities from HA."""
         return await context_for_domain(self.ha, "light")
 
-    @tool
+    @tool  # type: ignore[untyped-decorator] # alfred-sdk has no py.typed yet
     async def dim_lights(self, room: str, level: int) -> dict[str, Any]:
         """Dim the lights in a room.
 
@@ -38,7 +38,7 @@ class LightingFeature(BaseFeature):
         )
         return {"entity_id": entity_id, "brightness": level}
 
-    @tool
+    @tool  # type: ignore[untyped-decorator] # alfred-sdk has no py.typed yet
     async def turn_off_lights(self, room: str) -> dict[str, Any]:
         """Turn off all lights in a room.
 
