@@ -115,9 +115,22 @@ class HAConnection:
 
         Returns the connection state after the first attempt completes, so the
         caller (POST /credentials) can immediately report connected-or-failed.
+
+        No-ops when the credentials are unchanged AND we're already connected.
+        Without this guard, every re-registration with Alfred's core (the SDK's
+        `register()` unconditionally emits `ServiceRegistered`, which the core
+        `credential_push_worker` answers by re-pushing the stored HA creds to
+        `POST /credentials` — this happens on every `on_connect` AND every 300s
+        refresh_loop re-register) would unconditionally tear down and reconnect
+        here, which fires `on_connect` again, which re-registers, which gets
+        re-pushed again — an infinite reconnect loop on the normal production
+        path (credentials saved once via the Settings UI).
         """
+        normalized = url.rstrip("/")
+        if normalized == self._url and token == self._token and self.conn_state == "connected":
+            return self.conn_state
         await self.stop()
-        self._url = url.rstrip("/")
+        self._url = normalized
         self._token = token
         self.conn_state = "disconnected"
         self._attempt_done = asyncio.Event()

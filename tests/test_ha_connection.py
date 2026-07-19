@@ -157,6 +157,33 @@ async def test_reconnect_after_drop_resubscribes(fake_ha: FakeHAServer, conn: HA
     assert "state_changed" in fake_ha.subscriptions  # re-subscribed after reconnect
 
 
+async def test_apply_credentials_idempotent_no_reconnect(
+    fake_ha: FakeHAServer, conn: HAConnection
+) -> None:
+    """Re-applying the SAME credentials while already connected must NOT reconnect.
+
+    Regression test for the credential re-push reconnect loop: core's
+    credential_push_worker re-POSTs the stored HA creds to /credentials on every
+    ServiceRegistered event (every on_connect AND every 300s refresh_loop
+    re-register). If apply_credentials unconditionally tore down and reconnected,
+    that re-push would trigger on_connect again, re-register again, get re-pushed
+    again — forever. A steady auth_attempts count proves the loop is broken.
+    """
+    state = await conn.apply_credentials(fake_ha.url, fake_ha.token)
+    assert state == "connected"
+    attempts_before = fake_ha.auth_attempts
+    assert attempts_before == 1
+
+    state = await conn.apply_credentials(fake_ha.url, fake_ha.token)
+
+    assert state == "connected"
+    assert conn.conn_state == "connected"
+    assert fake_ha.auth_attempts == attempts_before  # no new handshake — no reconnect
+    # entity state fetched at the original connect is still intact (proves we
+    # didn't tear down and refetch)
+    assert conn.states["light.bedroom_lamp"].state == "on"
+
+
 async def test_apply_credentials_switches_servers(
     fake_ha: FakeHAServer, conn: HAConnection
 ) -> None:
@@ -170,9 +197,13 @@ async def test_apply_credentials_switches_servers(
     try:
         await conn.apply_credentials(fake_ha.url, fake_ha.token)
         assert "light.bedroom_lamp" in conn.states
+        assert fake_ha.auth_attempts == 1
         state = await conn.apply_credentials(other.url, "other-token")
         assert state == "connected"
         assert "light.other" in conn.states
         assert "light.bedroom_lamp" not in conn.states
+        # a genuinely different url DOES reconnect — the idempotency guard must
+        # not suppress real credential changes
+        assert other.auth_attempts == 1
     finally:
         await other.stop()
