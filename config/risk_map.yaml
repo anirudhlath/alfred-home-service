@@ -1,0 +1,6 @@
+# Risk tiers for generated tools (contract C9). Data, not code — edit freely.
+critical:
+  domains: [lock, alarm_control_panel]
+  cover_device_classes: [garage, garage_door, gate, door]
+elevated:
+  domains: [script, automation, climate, water_heater, cover, vacuum]

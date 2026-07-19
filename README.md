@@ -1,119 +1,101 @@
 # alfred-home-service
 
-A small async microservice that wraps the [Home Assistant](https://www.home-assistant.io/) REST API and exposes smart-home tools to [Alfred](https://github.com/anirudhlath/alfred) — a multi-agent home assistant — over an MCP-style JSON-RPC endpoint.
+An async microservice that owns all Home Assistant communication for
+[Alfred](https://github.com/anirudhlath/alfred). It connects to HA over the
+**WebSocket API**, discovers every entity/device/area, **generates** its tool
+surface from HA's own service catalog, forwards every state change onto
+Alfred's event bus, and accepts credentials pushed at runtime from Alfred's UI.
 
-Built with FastAPI + httpx, packaged with [uv](https://docs.astral.sh/uv/), Python 3.13+.
+Built with FastAPI + websockets + aiomqtt, packaged with
+[uv](https://docs.astral.sh/uv/), Python 3.13+.
 
 ## How it fits into Alfred
 
-Alfred never talks to Home Assistant directly. This service is the sovereign owner of all Home Assistant communication; Alfred reaches smart-home devices only through it, via the `alfred-sdk` bridge:
-
 ```
-┌──────────────┐  tool manifest + context   ┌──────────────┐                 ┌────────────────┐
-│    Alfred    │ ◄────── via Redis ──────── │ home-service │  REST (httpx)   │ Home Assistant │
-│  Home Agent  │                            │   (FastAPI)  │ ──────────────► │                │
-│              │ ── POST /mcp (JSON-RPC) ─► │              │                 │                │
-└──────────────┘                            └──────────────┘                 └────────────────┘
-```
-
-1. **Registration** — on startup, the service uses `alfred_sdk.AlfredClient` to publish its tool manifest into Alfred's Redis tool registry, along with a context snapshot of live entity states (lights, scenes). A background loop re-registers every 5 minutes so the context stays fresh.
-2. **Dispatch** — Alfred's Home Agent selects a tool (e.g. `lighting.dim_lights`) and POSTs a JSON-RPC-style request to this service's `/mcp` endpoint. The service dispatches to the matching feature method and returns the result.
-3. **Execution** — feature methods call Home Assistant's REST API (`/api/states`, `/api/services/<domain>/<service>`) through a shared async `httpx` client.
-
-The core app (`app/`) has **zero Alfred dependencies** — `HomeAssistantClient` and the FastAPI server run standalone. The Alfred integration lives entirely in `alfred_ext/` and activates only when `alfred-sdk` is installed (without it, the server still boots and serves `/health`, but tool registration and `/mcp` dispatch are unavailable).
-
-## Plugin architecture: `BaseFeature`
-
-Capabilities are plugins in `alfred_ext/features/`. Each feature subclasses `alfred_sdk.BaseFeature`, declares a `feature_name`, exposes tools with the `@tool` decorator, and reports live entity state via `get_context()`:
-
-```python
-class LightingFeature(BaseFeature):
-    feature_name = "lighting"
-
-    def __init__(self, ctx):          # ctx.ha is the shared HomeAssistantClient
-        super().__init__()
-        self.ha = ctx.ha
-
-    async def get_context(self) -> ContextSnapshot:
-        return await context_for_domain(self.ha, "light")
-
-    @tool
-    async def dim_lights(self, room: str, level: int) -> dict:
-        """Dim the lights in a room. ..."""
+┌──────────────┐  tool manifest + context    ┌──────────────┐                    ┌────────────────┐
+│    Alfred    │ ◄────── via Redis ───────── │ home-service │  WebSocket (auth,  │ Home Assistant │
+│  Home Agent  │                             │   (FastAPI)  │  events, registry, │                │
+│              │ ── POST /mcp (JSON-RPC) ──► │              │  call_service) ──► │                │
+│  Alfred core │ ── POST /credentials ─────► │              │                    │                │
+└──────────────┘                             └──────┬───────┘                    └────────────────┘
+                                                    │ every state_changed
+                                                    ▼
+                                       MQTT home/state_changed
+                                       (bridge → alfred:home:state_changed)
 ```
 
-Features are auto-discovered: `alfred_ext/register.py` scans the `alfred_ext.features` package with `client.discover_features()`, so adding a capability means dropping a new module into `alfred_ext/features/` — no registration boilerplate. Tool names are namespaced as `<feature_name>.<method>` and tool schemas are derived from the method signatures and docstrings.
-
-Built-in features:
-
-| Feature | Tools | What it does |
-|---|---|---|
-| `lighting` | `lighting.dim_lights`, `lighting.turn_off_lights` | Brightness control and on/off per room |
-| `scenes` | `scenes.set_scene` | Activate Home Assistant scenes |
+1. **Credentials** — Alfred's settings UI shows a Home Assistant card (this
+   service registers a `credentials_schema` with fields `url` + `token`).
+   Saving pushes `POST /credentials {url, token}`; the service connects live
+   and returns its resulting health. `.env` `HA_HOST`/`HA_TOKEN` remain a dev
+   fallback. Credentials are held in memory only — on restart, Alfred's core
+   re-pushes them (ServiceRegistered event).
+2. **Discovery** — on connect, the service subscribes to `state_changed` and
+   registry-updated events and fetches the entity/device/area registries plus
+   the service catalog. The `EntityIndex` resolves areas and friendly names to
+   real entity IDs (no name-guessing). Renames/additions in HA are picked up
+   live; a NEW integration domain requires a service restart.
+3. **Generated capabilities** — `CapabilityGenerator` crosses the service
+   catalog with discovered entities. Compact `audience: reflex` tools (lights,
+   switches, media players, scenes) carry live area/entity values in their
+   parameter descriptions; every other domain with entities gets
+   `audience: conscious` tools plus a generic `home.call_service` escape
+   hatch. Risk tiers come from `config/risk_map.yaml` (data, not code).
+4. **State ingest** — every `state_changed` becomes a bus-schema
+   `StateChangedEvent` published to MQTT `home/state_changed`. No HA-side
+   automation is required anymore.
 
 ## API
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/mcp` | POST | JSON-RPC-style tool call: `{"method": "lighting.dim_lights", "params": {"room": "living room", "level": 40}, "id": "req-001"}` → `{"id": "req-001", "result": {...}, "error": null}` |
-| `/health` | GET | `{"status": "ok", "service": "home-service"}` |
+| `/mcp` | POST | JSON-RPC-style tool call: `{"method": "home.light_turn_on", "params": {"target": "Living Room", "brightness_pct": 40}, "id": "req-001"}` → `{"id": "req-001", "result": {...}, "error": null}`. Errors in-band (HTTP 200). |
+| `/credentials` | POST | `{"url": "...", "token": "..."}` → applies live, returns `{"status": "ok", "health": ...}`. 422 on unknown/missing fields. Trusted network only. |
+| `/health` | GET | `{"status": "ok", "service": "home-service", "ha": {"state": "connected"\|"auth_failed"\|"unreachable"\|"disconnected", "entities": N, "areas": N, "last_event_age_s": ...}}` |
 
-Errors are returned in-band (HTTP 200 with an `error` field), matching JSON-RPC conventions.
-
-## Quickstart
-
-### Prerequisites
-
-- Python 3.13+ and [uv](https://docs.astral.sh/uv/)
-- A Home Assistant instance and a [long-lived access token](https://www.home-assistant.io/docs/authentication/#your-account-profile)
-- For full Alfred integration: a Redis instance and a checkout of the [alfred](https://github.com/anirudhlath/alfred) repo (`alfred-sdk` lives at `alfred/sdk/` and is not on PyPI)
-
-### Configuration
-
-All configuration is via environment variables (or a git-ignored `.env` file in the repo root, loaded automatically). The Home Assistant token is never stored in the repo.
+## Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `HA_HOST` | `http://homeassistant.local:8123` | Home Assistant base URL |
-| `HA_TOKEN` | *(required)* | Home Assistant long-lived access token |
-| `SERVICE_HOST` | `localhost` | Hostname Alfred uses to reach this service's `/mcp` endpoint |
-| `REDIS_URL` | `redis://localhost:6379` | Alfred's tool-registry Redis (used by `alfred-sdk`) |
+| `HA_HOST` | *(unset)* | Dev fallback HA base URL (UI-pushed credentials are authoritative) |
+| `HA_TOKEN` | *(unset)* | Dev fallback long-lived access token |
+| `SERVICE_HOST` | `localhost` | Hostname Alfred uses to reach `/mcp` and `/credentials` |
+| `REDIS_URL` | `redis://localhost:6379` | Alfred's tool-registry Redis (alfred-sdk) |
+| `MQTT_HOST` | `localhost` | MQTT broker for state forwarding |
+| `MQTT_PORT` | `1883` | MQTT broker port |
 
-### Run locally
+Risk/audience tuning lives in `config/risk_map.yaml` and
+`config/reflex_tools.yaml` — edit YAML, restart, no code changes.
+
+## Run locally
 
 ```bash
 uv venv --python 3.13
 uv pip install -e ".[dev]" ../alfred/sdk   # adjust path to your alfred checkout
-HA_TOKEN=<your-token> .venv/bin/uvicorn app.server:app --host 0.0.0.0 --port 8000
+uv run uvicorn app.server:app --host 0.0.0.0 --port 8000
 ```
 
-If Alfred's Redis isn't reachable, the service logs a warning and keeps serving — registration is best-effort by design.
+alfred-sdk is required (installed from the alfred monorepo source — not on
+PyPI). Redis/MQTT are best-effort: without them the service still boots and
+serves `/health`, `/credentials`, `/mcp`.
 
-### Run in a container
-
-The `Containerfile` builds the service together with `alfred-sdk` from monorepo source. The build context must be the workspace root that contains both `alfred/` and `home-service/`:
+## Tests & quality gates
 
 ```bash
-podman build -f home-service/Containerfile -t home-service .
-podman run -e HA_HOST=http://homeassistant.local:8123 -e HA_TOKEN=<your-token> \
-  -e SERVICE_HOST=<host-alfred-can-reach> -e REDIS_URL=redis://<alfred-redis>:6379 \
-  -p 8000:8000 home-service
+uv run pytest
+uv run ruff check . && uv run ruff format .
+uv run mypy --strict app alfred_ext
 ```
 
-## Tests
-
-```bash
-uv venv --python 3.13
-uv pip install -e ".[dev]" ../alfred/sdk
-.venv/bin/pytest
-```
-
-Tests mock the Home Assistant API with `unittest.mock` and drive the FastAPI app in-process via httpx's `ASGITransport` — no live Home Assistant or Redis needed.
+Tests run a fake HA WebSocket server in-process — no live Home Assistant,
+Redis, or MQTT needed.
 
 ## Security notes
 
-- The HA token is read from the environment only; `.env` is git-ignored.
-- `/mcp` is unauthenticated by design — deploy on a trusted private network alongside Alfred. Do not expose it to the public internet.
+- The HA token is held in memory only (pushed) or read from env (dev); never
+  written to disk here. Alfred core keeps the durable copy in the OS keyring.
+- `/mcp` and `/credentials` are unauthenticated by design — deploy on a
+  trusted private network alongside Alfred. Do not expose to the internet.
 
 ## License
 
