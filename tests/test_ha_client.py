@@ -1,7 +1,8 @@
 """Tests for Home Assistant client wrapper."""
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 
 @pytest.mark.asyncio

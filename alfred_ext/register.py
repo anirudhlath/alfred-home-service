@@ -9,10 +9,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from alfred_sdk import AlfredClient
 from dotenv import load_dotenv
 
 import alfred_ext.features as features_pkg
-from alfred_sdk import AlfredClient
 from app.ha_client import HomeAssistantClient
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
