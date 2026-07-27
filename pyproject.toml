@@ -1,39 +1,52 @@
 [project]
 name = "home-service"
-version = "0.1.0"
-description = "Home Assistant wrapper microservice"
+version = "0.2.0"
+description = "Home Assistant wrapper microservice — discovery, generated capabilities, state ingest"
 requires-python = ">=3.13"
 dependencies = [
     "httpx>=0.27",
     "fastapi>=0.115",
     "uvicorn>=0.34",
     "python-dotenv>=1.0",
+    "websockets>=14.0",
+    "aiomqtt>=2.0",
+    "loguru>=0.7",
+    "pyyaml>=6.0",
+    "pydantic>=2.0",
+    "alfred-sdk>=0.1.0",
 ]
 
 [project.optional-dependencies]
-alfred = [
-    "alfred-sdk @ git+https://github.com/anirudhlath/alfred@v0.1.0#subdirectory=sdk",
-]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
-    "ruff>=0.15.16",
+    "ruff>=0.15",
     "mypy>=2.1",
+    "types-PyYAML>=6.0",
 ]
+
+# alfred-sdk is not on PyPI. Pinned to the origin/master commit carrying Plan 1's SDK
+# contract (audience/risk/credentials_*); switch to an alfred release tag once v0.2.0 ships.
+[tool.uv.sources]
+alfred-sdk = { git = "https://github.com/anirudhlath/alfred.git", rev = "b02bc0f42682ea277954e16ef106183e9ccf21a3", subdirectory = "sdk" }
 
 [tool.setuptools.packages.find]
 include = ["app*", "alfred_ext*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 
 [tool.ruff]
-target-version = "py313"
 line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
 
 [tool.mypy]
-python_version = "3.13"
 strict = true
+python_version = "3.13"
 
 # alfred-sdk ships no `py.typed` marker (tracked upstream in alfred/sdk), so its exports
 # resolve to `Any` and mypy can't see into it. This override ONLY suppresses the
@@ -43,5 +56,5 @@ strict = true
 # override once alfred-sdk ships a `py.typed` marker.
 [[tool.mypy.overrides]]
 module = ["alfred_sdk.*"]
-ignore_missing_imports = true
 follow_imports = "skip"
+ignore_missing_imports = true

@@ -1,0 +1,18 @@
+# Compact reflex-tier tool selection: domain → service → extra optional fields.
+# Only these services become audience:"reflex" tools (kept small so the SLM
+# prompt stays small). Everything else is reachable for the Conscious engine
+# via generated per-domain tools or the home.call_service escape hatch.
+light:
+  turn_on: [brightness_pct]
+  turn_off: []
+switch:
+  turn_on: []
+  turn_off: []
+media_player:
+  turn_on: []
+  turn_off: []
+  media_play: []
+  media_pause: []
+  volume_set: [volume_level]
+scene:
+  turn_on: []
