@@ -35,7 +35,11 @@ jobs:
         if: github.event_name != 'pull_request'
         run: echo "push event"
 
-  ci-ok:
+  # Job id `gate`, display name `ci-ok`. `needs.ci-ok.result` would parse as a subtraction
+  # — hyphens are not legal in a GitHub expression property path. The required-check
+  # setting matches the NAME, so it is unaffected.
+  gate:
+    name: ci-ok
     if: always()
     needs: [python, pr-title]
     runs-on: ubuntu-latest
@@ -45,3 +49,40 @@ jobs:
         run: |
           echo "$RESULTS"
           if echo "$RESULTS" | grep -Eq '"result": "(failure|cancelled|skipped)"'; then exit 1; fi
+
+  # home-service is baked into alfred's fat image and has no deployment of its own. A merge
+  # here asks alfred to rebuild, and alfred's deploy job checks out both repos at their
+  # current trunks. No third runner, no duplicated deploy logic.
+  dispatch:
+    name: ask alfred to redeploy
+    needs: [gate]
+    # `always() &&` is load-bearing: without it a SKIPPED upstream job propagates down the
+    # needs graph and this silently skips on every push, even with `gate` green.
+    if: >-
+      ${{ always()
+      && needs.gate.result == 'success'
+      && github.event_name == 'push'
+      && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: POST repository_dispatch to anirudhlath/alfred
+        env:
+          TOKEN: ${{ secrets.ALFRED_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::ALFRED_DISPATCH_TOKEN is not set — alfred will not be redeployed"
+            exit 1
+          fi
+          code=$(curl -sS -o /tmp/resp.json -w '%{http_code}' \
+            -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/anirudhlath/alfred/dispatches \
+            -d '{"event_type":"home-service-merged"}')
+          echo "HTTP $code"
+          if [ "$code" != "204" ]; then
+            cat /tmp/resp.json
+            echo "::error::dispatch failed (HTTP $code) — alfred was NOT redeployed"
+            exit 1
+          fi
+          echo "dispatched home-service-merged to anirudhlath/alfred"
