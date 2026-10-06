@@ -476,6 +476,22 @@ async def test_a_failed_startup_clear_and_connect_replace_heal_on_the_next_event
         assert not publisher.dirty
 
 
+async def test_a_failed_connect_replace_heals_when_the_connect_registration_lands(
+    app: FastAPI, fake_ha: FakeHAServer, logs: list[Any]
+) -> None:
+    """A connect replace lost to Redis leaves whatever the hash held before. The
+    registration the connect makes next proves Redis back, so it republishes."""
+    live = app.state.live_state
+    live.replace.side_effect = [ConnectionError("redis down"), None]
+
+    assert await app.state.ha.apply_credentials(fake_ha.url, fake_ha.token) == "connected"
+
+    assert live.replace.await_count == 2  # the failed connect one, then the heal
+    assert _states(live.replace.await_args.args[0])["light.bedroom_lamp"] == "on"
+    assert not app.state.live_state_publisher.dirty
+    assert _live_state_logs(logs) == ["WARNING", "INFO"]
+
+
 async def test_a_failed_disconnect_clear_stays_dirty_until_the_reconnect_replace(
     connected_app: FastAPI, fake_ha: FakeHAServer, logs: list[Any]
 ) -> None:
