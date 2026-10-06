@@ -164,10 +164,10 @@ async def test_apply_credentials_idempotent_no_reconnect(
 
     Regression test for the credential re-push reconnect loop: core's
     credential_push_worker re-POSTs the stored HA creds to /credentials on every
-    ServiceRegistered event (every on_connect re-register). If apply_credentials
-    unconditionally tore down and reconnected, that re-push would trigger on_connect
-    again, re-register again, get re-pushed again — forever. A steady auth_attempts
-    count proves the loop is broken.
+    ServiceRegistered event (every re-register, on each HA connect and on each HA
+    registry change). If apply_credentials unconditionally tore down and reconnected,
+    that re-push would trigger on_connect again, re-register again, get re-pushed
+    again — forever. A steady auth_attempts count proves the loop is broken.
     """
     state = await conn.apply_credentials(fake_ha.url, fake_ha.token)
     assert state == "connected"
@@ -213,6 +213,9 @@ def _counting(conn: HAConnection) -> list[int]:
     drops = [0]
 
     async def on_disconnect() -> None:
+        # Suspend before counting, as a real listener (a Redis write) does. A listener
+        # that never yields would pass even if apply_credentials returned before it ran.
+        await asyncio.sleep(0)
         drops[0] += 1
 
     conn.add_disconnect_listener(on_disconnect)
@@ -266,3 +269,59 @@ async def test_a_failing_disconnect_listener_does_not_stop_reconnecting(
     await conn.apply_credentials(fake_ha.url, fake_ha.token)
     await fake_ha.drop_connections()
     await eventually(lambda: connects[0] == 2, timeout=3.0)
+
+
+async def test_a_failing_disconnect_listener_does_not_skip_the_next(
+    fake_ha: FakeHAServer, conn: HAConnection
+) -> None:
+    async def broken() -> None:
+        raise RuntimeError("boom")
+
+    conn.add_disconnect_listener(broken)
+    drops = _counting(conn)
+    assert await conn.apply_credentials(fake_ha.url, "wrong-token") == "auth_failed"
+    assert drops[0] == 1
+
+
+async def test_disconnect_listener_quiet_when_stopped(
+    fake_ha: FakeHAServer, conn: HAConnection
+) -> None:
+    drops = _counting(conn)
+    await conn.apply_credentials(fake_ha.url, fake_ha.token)
+    await conn.stop()
+    assert drops[0] == 0
+
+
+async def test_disconnect_listener_quiet_when_switching_servers(
+    fake_ha: FakeHAServer, conn: HAConnection
+) -> None:
+    other = FakeHAServer(token="other-token")
+    await other.start()
+    try:
+        drops = _counting(conn)
+        await conn.apply_credentials(fake_ha.url, fake_ha.token)
+        assert await conn.apply_credentials(other.url, "other-token") == "connected"
+        assert drops[0] == 0
+    finally:
+        await other.stop()
+
+
+async def test_a_superseded_apply_credentials_still_returns(
+    fake_ha: FakeHAServer, conn: HAConnection
+) -> None:
+    """A second apply_credentials cancels the first attempt; the first caller must not hang."""
+    entered = asyncio.Event()
+
+    async def stall() -> None:
+        entered.set()
+        await asyncio.Event().wait()  # holds the rejected attempt open until cancelled
+
+    conn.add_disconnect_listener(stall)
+    first = asyncio.create_task(conn.apply_credentials(fake_ha.url, "wrong-token"))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+    second = await asyncio.wait_for(conn.apply_credentials(fake_ha.url, fake_ha.token), 1.0)
+
+    assert second == "connected"
+    # The superseded caller's attempt never finished, so it must not report success.
+    assert await asyncio.wait_for(first, timeout=1.0) != "connected"
