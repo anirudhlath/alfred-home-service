@@ -226,7 +226,7 @@ async def test_connect_publishes_live_state_then_registers(
 
 
 @pytest.mark.parametrize("failing", ["index", "capabilities"])
-async def test_connect_publishes_before_anything_that_can_fail(
+async def test_connect_publishes_even_when_the_index_or_tool_surface_fails(
     app: FastAPI, fake_ha: FakeHAServer, monkeypatch: pytest.MonkeyPatch, failing: str
 ) -> None:
     """A credential swap stops the old connection without a disconnect clear, so the new
@@ -244,6 +244,59 @@ async def test_connect_publishes_before_anything_that_can_fail(
     live = app.state.live_state
     live.replace.assert_awaited_once()
     assert _states(live.replace.await_args.args[0])["light.bedroom_lamp"] == "on"
+
+
+async def test_the_index_reflects_a_reconnect_while_its_replace_waits_on_redis(
+    connected_app: FastAPI, fake_ha: FakeHAServer
+) -> None:
+    """/health and /mcp read the index, and a hung Redis can hold the connect replace for
+    the writer's whole 5 s timeout. Meanwhile they must see the new connection's entities,
+    not the previous connection's."""
+    index, live = connected_app.state.index, connected_app.state.live_state
+    before = index.entity_count()
+    fake_ha.states.append({"entity_id": "light.new_lamp", "state": "off", "attributes": {}})
+    assert index.get("light.new_lamp") is None
+    sent, reply = asyncio.Event(), asyncio.Event()
+
+    async def hung_replace(snapshot: ContextSnapshot) -> None:
+        sent.set()
+        await reply.wait()
+
+    live.replace.side_effect = hung_replace
+    try:
+        await fake_ha.drop_connections()
+        await asyncio.wait_for(sent.wait(), _BOUND)  # the reconnect's replace waits on Redis
+        assert _states(live.replace.await_args.args[0])["light.new_lamp"] == "off"
+
+        assert index.get("light.new_lamp") is not None
+        async with _client(connected_app) as http:
+            health = (await http.get("/health")).json()["ha"]
+        assert (health["state"], health["entities"]) == ("connected", before + 1)
+    finally:
+        reply.set()
+
+
+async def test_nothing_yields_from_connected_to_the_connect_snapshot_handover(
+    app: FastAPI, fake_ha: FakeHAServer
+) -> None:
+    """on_connect rebuilds the index in a try whose finally publishes. A yield in there would
+    let a drop's cancel land inside the try, and the finally would then publish while the
+    setup unwinds. A callback queued as HA turns "connected" must not have run by the
+    handover. HAConnection logs "Connected to HA" straight after setting the flag."""
+    loop = asyncio.get_running_loop()
+    yielded = asyncio.Event()
+    handler = logger.add(
+        lambda _: loop.call_soon(yielded.set),
+        filter=lambda record: record["message"].startswith("Connected to HA"),
+    )
+    at_handover: list[bool] = []
+    app.state.live_state.replace.side_effect = lambda _: at_handover.append(yielded.is_set())
+    try:
+        assert await app.state.ha.apply_credentials(fake_ha.url, fake_ha.token) == "connected"
+    finally:
+        logger.remove(handler)
+    assert at_handover == [False]
+    assert yielded.is_set()  # the hook fired, so the check above was not vacuous
 
 
 async def test_a_state_change_updates_one_entity(

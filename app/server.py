@@ -134,6 +134,8 @@ class Registrar:
             if await self._attempt():
                 # Let go of ourselves before the hook, as a direct success's stop() does: a
                 # registration failing while the hook runs must schedule a retry of its own.
+                # Shutdown won't await us now: the writer's FIFO lock alone orders its final
+                # clear and aclose behind our heal, while the hook's only await is its write.
                 if self._retry is asyncio.current_task():
                     self._retry = None
                 await self._registered()
@@ -201,6 +203,7 @@ def create_app() -> FastAPI:
     conn.add_disconnect_listener(publisher.clear)
 
     async def rebuild_index() -> None:
+        # Never awaits: on_connect depends on it (see there).
         index.rebuild(
             entity_registry=conn.entity_registry,
             device_registry=conn.device_registry,
@@ -247,11 +250,15 @@ def create_app() -> FastAPI:
     app.state.capabilities_ready = False
 
     async def on_connect() -> None:
-        # First, so a failure below cannot cost it: after a credential swap, which clears
-        # nothing, this replace is all that retires the old instance's entries. It reads
-        # only conn.states and conn.services_catalog, never the index.
-        await publisher.publish()
-        await rebuild_index()
+        # Index first, so /health and /mcp never read the previous connection's while the
+        # replace waits on Redis; publish in a finally, so a failed rebuild cannot cost it
+        # (after a credential swap, which clears nothing, it alone retires the old entries).
+        # rebuild_index must never await: nothing then yields between "connected" and the
+        # handover, and no drop's cancel can land in the try and publish from the finally.
+        try:
+            await rebuild_index()
+        finally:
+            await publisher.publish()
         if not app.state.capabilities_ready:
             specs = generator.generate(conn.services_catalog, index)
             ctx = HomeCapabilitiesContext(conn=conn, index=index, generator=generator, specs=specs)
