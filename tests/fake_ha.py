@@ -416,6 +416,9 @@ class FakeHAServer:
         self.subscriptions: dict[str, int] = {}
         self.auth_attempts = 0
         self.fail_service_calls = False
+        # get_states sets get_states_requested, then waits for get_states_gate when one is set
+        self.get_states_requested = asyncio.Event()
+        self.get_states_gate: asyncio.Event | None = None
         self.port = 0
         self._server: Server | None = None
         self._connections: set[ServerConnection] = set()
@@ -466,6 +469,9 @@ class FakeHAServer:
                 self.subscriptions[str(msg.get("event_type", "*"))] = msg_id
                 await self._send_result(ws, msg_id, None)
             case "get_states":
+                self.get_states_requested.set()
+                if self.get_states_gate is not None:
+                    await self.get_states_gate.wait()
                 await self._send_result(ws, msg_id, self.states)
             case "get_services":
                 await self._send_result(ws, msg_id, self.services)

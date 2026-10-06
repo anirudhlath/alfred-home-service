@@ -88,7 +88,8 @@ class Registrar:
     registration requested while a retry is pending runs as soon as any attempt in
     flight ends, and its success cancels the retry. This keeps a service started while
     Redis is unreachable from staying unregistered — and Alfred pushes credentials only
-    in answer to ServiceRegistered.
+    in answer to ServiceRegistered. ``on_registered`` is awaited after each registration
+    that lands, once any pending retry has been let go.
     """
 
     def __init__(
@@ -97,8 +98,10 @@ class Registrar:
         *,
         initial_backoff: float = 1.0,
         max_backoff: float = 60.0,
+        on_registered: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._client = client
+        self._on_registered = on_registered
         self._initial_backoff = initial_backoff
         self._max_backoff = max_backoff
         self._retry: asyncio.Task[None] | None = None
@@ -107,6 +110,7 @@ class Registrar:
     async def register(self) -> None:
         if await self._attempt():
             await self.stop()
+            await self._registered()
         elif self._retry is None or self._retry.done():
             self._retry = asyncio.create_task(self._retry_until_registered(), name="register-retry")
 
@@ -128,8 +132,17 @@ class Registrar:
         while True:
             await asyncio.sleep(delay)
             if await self._attempt():
+                await self._registered()
                 return
             delay = min(delay * 2, self._max_backoff)
+
+    async def _registered(self) -> None:
+        if self._on_registered is None:
+            return
+        try:
+            await self._on_registered()
+        except Exception:
+            logger.exception("on_registered hook failed")
 
     async def stop(self) -> None:
         """Cancel a pending retry and wait for it to end."""
@@ -171,13 +184,13 @@ def create_app() -> FastAPI:
     forwarder = StateForwarder()
     client = build_client()
     live_state = LiveStateWriter(client.redis_url, client.service_name)
-    registrar = Registrar(client)
+    publisher = LiveStatePublisher(live_state, conn)
+    # A registration that lands proves Redis reachable: heal any write it lost meanwhile.
+    registrar = Registrar(client, on_registered=publisher.heal)
     generator = CapabilityGenerator(
         RiskMap.load(CONFIG_DIR / "risk_map.yaml"),
         load_reflex_config(CONFIG_DIR / "reflex_tools.yaml"),
     )
-
-    publisher = LiveStatePublisher(live_state, conn)
 
     conn.add_state_listener(forwarder.on_state_changed)
     conn.add_state_listener(publisher.on_state_changed)

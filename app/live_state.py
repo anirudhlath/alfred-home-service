@@ -69,9 +69,16 @@ class LiveStatePublisher:
     A failed write leaves Alfred's copy wrong in a way the next update cannot fix: an
     entity that changed during a Redis outage stays stale until it changes again, and a
     hash that a failed clear left behind survives underneath fresh updates. So any failed
-    write marks the hash dirty, and while it is dirty the next state change republishes
-    every entity instead of its own. A replace that lands clears the flag. Nothing here
-    runs on a schedule: the heal rides on HA's next event.
+    write marks the hash dirty, and heal() makes it whole again: a full replace from a live
+    connection, or a clear when HA is not connected. It runs on the next state change and
+    when a registration lands, which proves Redis reachable. A heal that lands clears the
+    flag, as does the connect replace. Nothing here runs on a schedule.
+
+    A heal replaces only while HA reports "connected", which HAConnection sets once a
+    connection's fresh states are in. Until then conn.states still holds the previous
+    connection's states, while state events already flow and the registration path is
+    never cancelled. The disconnect's clear is requested only after that flag drops, so
+    a replace handed over while it was up lands before the clear.
     """
 
     def __init__(self, writer: LiveStateWriter, conn: HAConnection) -> None:
@@ -94,9 +101,21 @@ class LiveStatePublisher:
         except Exception as exc:
             self._failed("replace", exc)
             return
-        if self._dirty:
-            self._dirty = False
-            logger.info("Live state republished in full — back in step with HA")
+        self._healed("republished in full")
+
+    async def heal(self) -> None:
+        """Make the hash whole again if a write failed; a no-op while it is clean."""
+        if not self._dirty:
+            return
+        if self._conn.conn_state == "connected":
+            await self.publish()
+            return
+        try:
+            await self._writer.clear()
+        except Exception as exc:
+            self._failed("clear", exc)
+            return
+        self._healed("cleared while HA is not connected")
 
     async def on_state_changed(
         self,
@@ -106,7 +125,7 @@ class LiveStatePublisher:
         attributes: dict[str, Any],
     ) -> None:
         """HAConnection state listener; it applied the event to conn.states first."""
-        if self._dirty:
+        if self._dirty and self._conn.conn_state == "connected":
             await self.publish()
             return
         try:
@@ -126,6 +145,11 @@ class LiveStatePublisher:
         except Exception as exc:
             self._failed("clear", exc)
 
+    def _healed(self, how: str) -> None:
+        if self._dirty:
+            self._dirty = False
+            logger.info("Live state {} — back in step with HA", how)
+
     def _failed(self, write: str, exc: Exception) -> None:
         # Once per outage: while dirty, every event retries quietly.
         if self._dirty:
@@ -133,7 +157,7 @@ class LiveStatePublisher:
         self._dirty = True
         logger.warning(
             "Live state out of step with HA ({} failed: {}); "
-            "the next connect or state change republishes it in full",
+            "the next connect, state change or registration heals it",
             write,
             exc,
         )
