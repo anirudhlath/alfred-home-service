@@ -10,6 +10,8 @@ Design notes:
 - Listeners are awaited inside the reader loop, so they MUST NOT issue
   WebSocket commands (would deadlock the correlation loop). Registry refresh
   therefore runs as a separate coalesced task.
+- Because listeners are awaited on the reader, a slow listener delays every
+  later frame: a hung Redis holds it for up to 5 s per live-state write.
 - `auth_invalid` is terminal: no retry until `apply_credentials` is called
   again with new credentials.
 - The `websockets` library handles ping/pong keepalive automatically.
