@@ -24,8 +24,16 @@ def test_entry_keeps_only_allowlisted_attributes() -> None:
 
 
 def test_a_domain_with_services_is_controllable() -> None:
-    lamp = HAEntityState(entity_id="light.bedroom_lamp", state="on", attributes={"brightness": 128})
-    assert build_entry(lamp, DEFAULT_SERVICES)[:2] == ("light", "controllable")
+    lamp = HAEntityState(
+        entity_id="light.bedroom_lamp",
+        state="on",
+        attributes={"brightness": 128, "effect_list": ["colorloop", "random"]},
+    )
+    assert build_entry(lamp, DEFAULT_SERVICES) == (
+        "light",
+        "controllable",
+        ContextEntry(entity_id="light.bedroom_lamp", state="on", attributes={"brightness": 128}),
+    )
 
 
 def test_snapshot_and_entry_classify_alike(default_states_map: dict[str, HAEntityState]) -> None:
