@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from typing import Any
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, create_autospec
 
 import pytest
 from alfred_sdk.context import ContextEntry, ContextSnapshot
+from alfred_sdk.live_state import LiveStateWriter
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from loguru import logger
@@ -37,8 +38,11 @@ async def app() -> AsyncIterator[FastAPI]:
     application.state.client.register = AsyncMock()
     application.state.client.unregister = AsyncMock()
     live = application.state.live_state
+    # Autospecced from the real writer: mypy skips alfred_sdk, so this is what fails a
+    # call that no longer matches the SDK's signature after a pin moves.
+    writer = create_autospec(LiveStateWriter, instance=True)
     for method in ("replace", "update", "remove", "clear", "aclose"):
-        setattr(live, method, AsyncMock())
+        setattr(live, method, getattr(writer, method))
     yield application
     await application.state.registrar.stop()
     await application.state.ha.stop()
