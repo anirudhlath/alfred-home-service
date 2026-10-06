@@ -1,8 +1,12 @@
 """home-service FastAPI server — MCP dispatch, credentials, health.
 
 Composition root: wires HAConnection → EntityIndex / CapabilityGenerator /
-StateForwarder / ContextRefresher, and registers the generated tool surface
+StateForwarder / LiveStateWriter, and registers the generated tool surface
 with Alfred via the SDK.
+
+Alfred hears from this service on events only. It registers at startup, on each
+HA connect and when HA's registries change, and it writes live state as HA
+reports changes (Alfred issue #281). Nothing here runs on a timer.
 
 The /mcp JSON-RPC contract ({method, params, id} → {id, result, error}) is
 unchanged from Alfred HomeAgent's perspective.
@@ -11,14 +15,14 @@ unchanged from Alfred HomeAgent's perspective.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 from alfred_sdk import AlfredClient
+from alfred_sdk.live_state import LiveStateWriter
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from loguru import logger
@@ -29,14 +33,12 @@ from app.capability_generator import CapabilityGenerator
 from app.entity_index import EntityIndex
 from app.ha_connection import HAConnection
 from app.home_feature import HomeCapabilitiesContext, HomeCapabilitiesFeature
+from app.live_state import build_entry, build_snapshot
 from app.risk_map import RiskMap, load_reflex_config
 from app.state_forwarder import StateForwarder
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-# Keep the periodic re-registration: refreshes the tool-registry entry and the
-# 10-min-TTL context key. LIVE context freshness comes from ContextRefresher.
-ENTITY_REFRESH_INTERVAL = 300.0
 CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
 
 
@@ -65,40 +67,90 @@ class CredentialsBody(BaseModel):
     token: str
 
 
-class ContextRefresher:
-    """Debounced live context refresh — re-registers with Alfred after state events.
+async def _cancel_and_wait(task: asyncio.Task[Any] | None) -> None:
+    """Cancel ``task`` and wait for it to end.
 
-    Event-driven with coalescing (not polling): the first event schedules one
-    refresh min_interval later; events during the window ride along.
+    The task's own cancellation, or whatever it unwinds with, is expected and swallowed.
+    A cancellation aimed at our caller while it waits reaches the caller, as a
+    CancelledError even when the task unwound with something else.
+    """
+    if task is None:
+        return
+    # cancelling() counts every cancel ever requested of the caller, including ones it has
+    # already handled, so only a rise from here on is aimed at this wait (the idiom
+    # asyncio.timeout uses, as does HAConnection._stop_locked).
+    caller = asyncio.current_task()
+    cancelling_at_entry = caller.cancelling() if caller is not None else 0
+    task.cancel()
+    try:
+        await task
+    except BaseException as exc:
+        if caller is not None and caller.cancelling() > cancelling_at_entry:
+            raise asyncio.CancelledError() from exc
+
+
+async def _run_all(*steps: Callable[[], Awaitable[None]]) -> None:
+    """Await each step in turn; a cancellation arriving part-way is raised after the last."""
+    cancelled: asyncio.CancelledError | None = None
+    for step in steps:
+        try:
+            await step()
+        except asyncio.CancelledError as exc:
+            cancelled = cancelled or exc
+    if cancelled is not None:
+        raise cancelled
+
+
+class Registrar:
+    """Registers with Alfred on demand; a failed attempt retries until one lands.
+
+    Not a refresh loop: once a registration succeeds, nothing stays scheduled. A
+    registration requested while a retry is pending runs at once, and its success
+    cancels the retry. This keeps a service started while Redis is unreachable from
+    staying unregistered — and Alfred pushes credentials only in answer to
+    ServiceRegistered.
     """
 
-    def __init__(self, client: AlfredClient, min_interval: float = 2.0) -> None:
-        self._client = client
-        self._min_interval = min_interval
-        self._pending: asyncio.Task[None] | None = None
-
-    async def on_state_changed(
+    def __init__(
         self,
-        entity_id: str,
-        old_state: str | None,
-        new_state: str | None,
-        attributes: dict[str, Any],
+        client: AlfredClient,
+        *,
+        initial_backoff: float = 1.0,
+        max_backoff: float = 60.0,
     ) -> None:
-        if self._pending is None or self._pending.done():
-            self._pending = asyncio.create_task(self._refresh_soon(), name="context-refresh")
+        self._client = client
+        self._initial_backoff = initial_backoff
+        self._max_backoff = max_backoff
+        self._retry: asyncio.Task[None] | None = None
 
-    async def _refresh_soon(self) -> None:
-        await asyncio.sleep(self._min_interval)
+    async def register(self) -> None:
+        if await self._attempt():
+            await self.stop()
+        elif self._retry is None or self._retry.done():
+            self._retry = asyncio.create_task(self._retry_until_registered(), name="register-retry")
+
+    async def _attempt(self) -> bool:
         try:
             await self._client.register()
         except Exception as exc:
-            logger.warning("Context refresh failed: {}", exc)
+            logger.warning("Could not register with Alfred: {}", exc)
+            return False
+        return True
+
+    async def _retry_until_registered(self) -> None:
+        delay = self._initial_backoff
+        while True:
+            await asyncio.sleep(delay)
+            if await self._attempt():
+                return
+            delay = min(delay * 2, self._max_backoff)
 
     async def stop(self) -> None:
-        if self._pending is not None and not self._pending.done():
-            self._pending.cancel()
-            with contextlib.suppress(BaseException):
-                await self._pending
+        """Cancel a pending retry and wait for it to end."""
+        # Let go of it before waiting: a registration that fails meanwhile then schedules
+        # a retry of its own, which stays tracked instead of being dropped on our return.
+        retry, self._retry = self._retry, None
+        await _cancel_and_wait(retry)
 
 
 def health_payload(conn: HAConnection, index: EntityIndex) -> dict[str, Any]:
@@ -132,20 +184,39 @@ def create_app() -> FastAPI:
     index = EntityIndex()
     forwarder = StateForwarder()
     client = build_client()
+    live_state = LiveStateWriter(client.redis_url, client.service_name)
+    registrar = Registrar(client)
     generator = CapabilityGenerator(
         RiskMap.load(CONFIG_DIR / "risk_map.yaml"),
         load_reflex_config(CONFIG_DIR / "reflex_tools.yaml"),
     )
-    refresher = ContextRefresher(client)
+
+    async def clear_live_state() -> None:
+        try:
+            await live_state.clear()
+        except Exception as exc:
+            logger.warning("Could not clear live state: {}", exc)
+
+    async def on_state_changed(
+        entity_id: str,
+        old_state: str | None,
+        new_state: str | None,
+        attributes: dict[str, Any],
+    ) -> None:
+        # HAConnection applied the event to conn.states before calling us.
+        try:
+            state = conn.states.get(entity_id)
+            if state is None:  # HA deleted the entity
+                await live_state.remove(entity_id)
+                return
+            domain, kind, entry = build_entry(state, conn.services_catalog)
+            await live_state.update(domain, kind, entry)
+        except Exception as exc:
+            logger.warning("Live state update failed for {}: {}", entity_id, exc)
 
     conn.add_state_listener(forwarder.on_state_changed)
-    conn.add_state_listener(refresher.on_state_changed)
-
-    async def try_register() -> None:
-        try:
-            await client.register()
-        except Exception as exc:
-            logger.warning("Could not register with Alfred (best-effort): {}", exc)
+    conn.add_state_listener(on_state_changed)
+    conn.add_disconnect_listener(clear_live_state)
 
     async def rebuild_index() -> None:
         index.rebuild(
@@ -155,37 +226,41 @@ def create_app() -> FastAPI:
             states=conn.states,
         )
 
-    async def refresh_loop() -> None:
-        while True:
-            await asyncio.sleep(ENTITY_REFRESH_INTERVAL)
-            await try_register()
-
-    @asynccontextmanager
-    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        # Register even with zero features so the credentials card appears in the UI.
-        await try_register()
-        await forwarder.start()
-        env_task = asyncio.create_task(apply_env_credentials(conn), name="env-credentials")
-        refresh_task = asyncio.create_task(refresh_loop(), name="register-refresh")
-        yield
-        for task in (env_task, refresh_task):
-            task.cancel()
-            with contextlib.suppress(BaseException):
-                await task
-        await refresher.stop()
-        await forwarder.stop()
-        await conn.stop()
+    async def unregister() -> None:
         try:
             await client.unregister()
         except Exception as exc:
             logger.warning("Could not unregister from Alfred: {}", exc)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        # A process killed before it could clear on disconnect left its hash behind.
+        await clear_live_state()
+        # Register even with zero features so the credentials card appears in the UI.
+        await registrar.register()
+        await forwarder.start()
+        env_task = asyncio.create_task(apply_env_credentials(conn), name="env-credentials")
+        yield
+        # Every step runs even if shutdown is cancelled part-way; the cancellation is
+        # raised after the last. HA stops before the registrar and the final clear, so no
+        # HA listener can schedule a registration retry or write live state after them.
+        await _run_all(
+            lambda: _cancel_and_wait(env_task),
+            forwarder.stop,
+            conn.stop,
+            registrar.stop,
+            clear_live_state,
+            unregister,
+            live_state.aclose,
+        )
 
     app = FastAPI(title="home-service", lifespan=lifespan)
     app.state.ha = conn
     app.state.index = index
     app.state.client = client
     app.state.forwarder = forwarder
-    app.state.refresher = refresher
+    app.state.live_state = live_state
+    app.state.registrar = registrar
     app.state.capabilities_ready = False
 
     async def on_connect() -> None:
@@ -205,11 +280,21 @@ def create_app() -> FastAPI:
                 "Reconnected to HA — capability set is frozen for this process; "
                 "restart if the HA instance or its service catalog changed"
             )
-        await try_register()
+        # Built and handed over with no await between, so the writer's FIFO lock
+        # orders it after every update requested before it.
+        snapshot = build_snapshot(conn.states, conn.services_catalog)
+        try:
+            await live_state.replace(snapshot)
+        except Exception as exc:
+            logger.warning("Could not publish live state: {}", exc)
+        await registrar.register()
 
     async def on_registries_updated() -> None:
+        # Never writes live state: this runs in HAConnection's registry-refresh task, which
+        # a disconnect does not cancel, so a write here could land after the disconnect's
+        # clear and bring back state for a connection that is gone.
         await rebuild_index()
-        await try_register()
+        await registrar.register()
 
     conn.add_connect_listener(on_connect)
     conn.add_registry_listener(on_registries_updated)
