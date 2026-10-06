@@ -225,6 +225,23 @@ async def test_connect_publishes_live_state_then_registers(
     assert lamps["light.bedroom_lamp"].state == "on"
 
 
+async def test_a_state_change_right_behind_the_get_states_reply_survives_the_connect(
+    app: FastAPI, fake_ha: FakeHAServer
+) -> None:
+    """HA can send an event straight behind its get_states reply, so both frames arrive
+    together and the reader handles the event before the connect setup resumes. Applied to
+    the previous states, it would then be overwritten by the older reply, and the connect
+    replace would publish the lamp as it was until it next changed."""
+    fake_ha.state_changes_after_get_states = [("light.bedroom_lamp", "on", "off")]
+
+    assert await app.state.ha.apply_credentials(fake_ha.url, fake_ha.token) == "connected"
+
+    live = app.state.live_state
+    live.update.assert_awaited_once()  # the event was handled, so the checks below bite
+    assert app.state.ha.states["light.bedroom_lamp"].state == "off"
+    assert _states(live.replace.await_args.args[0])["light.bedroom_lamp"] == "off"
+
+
 @pytest.mark.parametrize("failing", ["index", "capabilities"])
 async def test_connect_publishes_even_when_the_index_or_tool_surface_fails(
     app: FastAPI, fake_ha: FakeHAServer, monkeypatch: pytest.MonkeyPatch, failing: str

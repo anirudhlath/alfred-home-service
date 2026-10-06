@@ -31,6 +31,9 @@ ConnState = Literal["connected", "auth_failed", "unreachable", "disconnected"]
 
 StateListener = Callable[[str, str | None, str | None, dict[str, Any]], Awaitable[None]]
 VoidListener = Callable[[], Awaitable[None]]
+# Runs on the reader as a command's successful result frame is handled, before the next
+# frame; an exception it raises fails the command instead.
+ResultHook = Callable[[Any], None]
 
 COMMAND_TIMEOUT = 30.0
 
@@ -76,7 +79,7 @@ class HAConnection:
         self._registry_refresh_task: asyncio.Task[None] | None = None
         self._registry_dirty = False
         self._next_msg_id = 1
-        self._pending: dict[int, asyncio.Future[Any]] = {}
+        self._pending: dict[int, tuple[asyncio.Future[Any], ResultHook | None]] = {}
         self._attempt_done = asyncio.Event()
         self._lifecycle_lock = asyncio.Lock()
 
@@ -255,15 +258,7 @@ class HAConnection:
             for event_type in SUBSCRIBED_EVENTS:
                 await self._cmd(ws, {"type": "subscribe_events", "event_type": event_type})
             await self._refresh_registries(ws)
-            raw_states: list[dict[str, Any]] = await self._cmd(ws, {"type": "get_states"}) or []
-            self.states = {
-                s["entity_id"]: HAEntityState(
-                    entity_id=s["entity_id"],
-                    state=s.get("state", "unknown"),
-                    attributes=s.get("attributes", {}),
-                )
-                for s in raw_states
-            }
+            await self._cmd(ws, {"type": "get_states"}, on_result=self._install_states)
             self.services_catalog = await self._cmd(ws, {"type": "get_services"}) or {}
             self.conn_state = "connected"
             logger.info(
@@ -284,6 +279,23 @@ class HAConnection:
             logger.error("HA post-connect setup failed: {}", exc)
             await ws.close()  # reader loop exits → _run marks unreachable + retries
 
+    def _install_states(self, raw_states: Any) -> None:
+        """Replace the states with get_states' reply, on the reader as its frame is handled.
+
+        HA may send a state_changed straight behind the reply, and the reader handles it
+        before this setup task resumes. Installed here, the reply is in place first and the
+        event applies on top of it; installed after the await, the older reply would
+        overwrite the event, and the connect snapshot would publish the stale value.
+        """
+        self.states = {
+            s["entity_id"]: HAEntityState(
+                entity_id=s["entity_id"],
+                state=s.get("state", "unknown"),
+                attributes=s.get("attributes", {}),
+            )
+            for s in raw_states or []
+        }
+
     async def _refresh_registries(self, ws: ClientConnection) -> None:
         self.entity_registry = await self._cmd(ws, {"type": "config/entity_registry/list"}) or []
         self.device_registry = await self._cmd(ws, {"type": "config/device_registry/list"}) or []
@@ -291,11 +303,13 @@ class HAConnection:
 
     # ── command correlation ──
 
-    async def _cmd(self, ws: ClientConnection, payload: dict[str, Any]) -> Any:
+    async def _cmd(
+        self, ws: ClientConnection, payload: dict[str, Any], *, on_result: ResultHook | None = None
+    ) -> Any:
         msg_id = self._next_msg_id
         self._next_msg_id += 1
         fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
-        self._pending[msg_id] = fut
+        self._pending[msg_id] = (fut, on_result)
         try:
             await ws.send(json.dumps({"id": msg_id, **payload}))
             return await asyncio.wait_for(fut, timeout=COMMAND_TIMEOUT)
@@ -303,7 +317,7 @@ class HAConnection:
             self._pending.pop(msg_id, None)
 
     def _fail_pending(self) -> None:
-        for fut in self._pending.values():
+        for fut, _ in self._pending.values():
             if not fut.done():
                 fut.set_exception(HACommandError("connection_lost", "WebSocket closed"))
         self._pending.clear()
@@ -313,10 +327,17 @@ class HAConnection:
     async def _handle_message(self, msg: dict[str, Any]) -> None:
         match msg.get("type"):
             case "result":
-                fut = self._pending.get(int(msg["id"]))
+                fut, on_result = self._pending.get(int(msg["id"]), (None, None))
                 if fut is not None and not fut.done():
                     if msg.get("success"):
-                        fut.set_result(msg.get("result"))
+                        result = msg.get("result")
+                        try:
+                            if on_result is not None:
+                                on_result(result)
+                        except Exception as exc:
+                            fut.set_exception(exc)
+                        else:
+                            fut.set_result(result)
                     else:
                         err = msg.get("error") or {}
                         fut.set_exception(

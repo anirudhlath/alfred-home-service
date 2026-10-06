@@ -419,6 +419,9 @@ class FakeHAServer:
         # get_states sets get_states_requested, then waits for get_states_gate when one is set
         self.get_states_requested = asyncio.Event()
         self.get_states_gate: asyncio.Event | None = None
+        # (entity_id, old_state, new_state) events sent straight behind the get_states reply,
+        # as HA does when a state changes while it answers
+        self.state_changes_after_get_states: list[tuple[str, str | None, str | None]] = []
         self.port = 0
         self._server: Server | None = None
         self._connections: set[ServerConnection] = set()
@@ -473,6 +476,8 @@ class FakeHAServer:
                 if self.get_states_gate is not None:
                     await self.get_states_gate.wait()
                 await self._send_result(ws, msg_id, self.states)
+                for entity_id, old_state, new_state in self.state_changes_after_get_states:
+                    await ws.send(json.dumps(self._state_changed(entity_id, old_state, new_state)))
             case "get_services":
                 await self._send_result(ws, msg_id, self.services)
             case "config/entity_registry/list":
@@ -530,6 +535,15 @@ class FakeHAServer:
         new_state: str | None,
         attributes: dict[str, Any] | None = None,
     ) -> None:
+        await self._broadcast(self._state_changed(entity_id, old_state, new_state, attributes))
+
+    def _state_changed(
+        self,
+        entity_id: str,
+        old_state: str | None,
+        new_state: str | None,
+        attributes: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         sub_id = self.subscriptions["state_changed"]
         attrs = attributes or {}
         data: dict[str, Any] = {
@@ -545,13 +559,11 @@ class FakeHAServer:
                 else None
             ),
         }
-        await self._broadcast(
-            {
-                "id": sub_id,
-                "type": "event",
-                "event": {"event_type": "state_changed", "data": data},
-            }
-        )
+        return {
+            "id": sub_id,
+            "type": "event",
+            "event": {"event_type": "state_changed", "data": data},
+        }
 
     async def push_registry_updated(self, kind: str, data: dict[str, Any]) -> None:
         """kind: 'entity' | 'device' | 'area'."""
