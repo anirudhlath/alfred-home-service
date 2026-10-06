@@ -59,17 +59,18 @@ only builds entries, in `app/live_state.py`.
 
 ## Gotchas
 
-- `alfred-sdk` is NOT on PyPI — CI and fresh installs resolve it via
-  `tool.uv.sources`-less direct git reference in the `alfred` extra
-  (`alfred-sdk @ git+https://github.com/anirudhlath/alfred@v0.1.0#subdirectory=sdk` in
-  `pyproject.toml`); container builds instead copy the source in directly (see
-  Containerfile).
+- `alfred-sdk` is NOT on PyPI. It is a base dependency (`alfred-sdk>=0.1.0` in
+  `[project.dependencies]`; the only extra is `dev`), and `[tool.uv.sources]` in
+  `pyproject.toml` pins it to an alfred commit (`git` + `rev` + `subdirectory = "sdk"`),
+  which `uv.lock` records — CI and fresh `uv sync` installs resolve that commit. Container
+  builds instead install the SDK from the copied alfred source and then install this
+  package with `--no-sources`, skipping the pin (see Containerfile).
 - To develop against unreleased local SDK changes, run
   `uv pip install -e ../alfred/sdk` after `uv sync` — this overlays the editable local
   checkout into the venv (verified: `alfred_sdk.__file__` then resolves under
-  `alfred/sdk/`, not the pinned git tag). Any subsequent `uv sync` reinstalls the pinned
-  `v0.1.0` git ref and silently drops the overlay, so re-run the `uv pip install -e` line
-  after every sync while iterating.
+  `alfred/sdk/`, not `.venv`). Any subsequent `uv sync` reinstalls the pinned git commit
+  and silently drops the overlay, so re-run the `uv pip install -e` line after every sync
+  while iterating.
 - `alfred-sdk` ships no `py.typed` marker yet (upstream gap in `alfred/sdk`), so only
   `alfred_sdk.*` (not `alfred_ext/`) is exempted from mypy via a `follow_imports = "skip"`
   override in `pyproject.toml`. `alfred_ext/` (the optional Alfred-integration layer) is
