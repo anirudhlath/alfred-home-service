@@ -433,6 +433,52 @@ async def test_cancelling_a_stop_caller_propagates_while_the_setup_unwinds(
         release.set()
 
 
+@pytest.mark.parametrize("stop_lands", ["after_a_drop", "with_its_caller_cancelled"])
+async def test_a_command_pending_when_stop_lands_during_the_setup_unwind_fails_at_once(
+    fake_ha: FakeHAServer, conn: HAConnection, stop_lands: str
+) -> None:
+    """stop() can land while the connect setup is still unwinding: after a drop (a
+    credential swap or shutdown arriving then), or with its own caller cancelled meanwhile.
+    A command HA has not answered must still fail at once with connection_lost, not wait
+    out COMMAND_TIMEOUT."""
+    entered, cleaning, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def slow_to_cancel() -> None:
+        entered.set()
+        try:
+            await release.wait()
+        finally:
+            cleaning.set()
+            await release.wait()  # cleanup that outlasts the first cancel
+
+    conn.add_connect_listener(slow_to_cancel)
+    gate = fake_ha.call_service_gate = asyncio.Event()  # HA leaves the call unanswered
+    try:
+        connecting = asyncio.create_task(conn.apply_credentials(fake_ha.url, fake_ha.token))
+        await asyncio.wait_for(entered.wait(), _BOUND)
+        call = asyncio.create_task(conn.call_service("light", "turn_on"))
+        await asyncio.wait_for(fake_ha.call_service_requested.wait(), _BOUND)
+
+        if stop_lands == "after_a_drop":
+            await fake_ha.drop_connections()
+            await asyncio.wait_for(cleaning.wait(), _BOUND)  # the drop's setup unwinds
+            await asyncio.wait_for(conn.stop(), _BOUND)
+        else:
+            stopper = asyncio.create_task(conn.stop())
+            await asyncio.wait_for(cleaning.wait(), _BOUND)  # stop() waits on the unwind
+            stopper.cancel()
+            await asyncio.wait([stopper], timeout=_BOUND)
+            assert stopper.cancelled()
+
+        with pytest.raises(HACommandError) as failed:
+            await asyncio.wait_for(call, 1.0)  # far below COMMAND_TIMEOUT
+        assert failed.value.code == "connection_lost"
+        assert await asyncio.wait_for(connecting, _BOUND) == "disconnected"
+    finally:
+        release.set()
+        gate.set()
+
+
 async def test_a_superseded_apply_credentials_still_returns(
     fake_ha: FakeHAServer, conn: HAConnection
 ) -> None:

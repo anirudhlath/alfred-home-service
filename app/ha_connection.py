@@ -219,12 +219,15 @@ class HAConnection:
                             await self._handle_message(json.loads(raw))
                     finally:
                         self._ws = None
+                        # Before any await: a cancel aimed at us during the wait below
+                        # (stop() landing, or its caller cancelled) would otherwise skip
+                        # this, and a pending command would wait out COMMAND_TIMEOUT.
+                        self._fail_pending()
                         # Wait for the setup to end, so the disconnect listeners below run
                         # after anything its connect listeners were writing, not alongside
                         # it. A cancel aimed at us while we wait still reaches us (see
                         # cancel_and_wait).
                         await cancel_and_wait(setup)
-                        self._fail_pending()
                 self.conn_state = "unreachable"
                 logger.warning("HA WebSocket closed — reconnecting in {:.1f}s", backoff)
                 await self._notify_disconnect()

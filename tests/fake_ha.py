@@ -419,6 +419,10 @@ class FakeHAServer:
         # get_states sets get_states_requested, then waits for get_states_gate when one is set
         self.get_states_requested = asyncio.Event()
         self.get_states_gate: asyncio.Event | None = None
+        # call_service sets call_service_requested, then waits for call_service_gate when one
+        # is set (HA leaving a command unanswered)
+        self.call_service_requested = asyncio.Event()
+        self.call_service_gate: asyncio.Event | None = None
         # (entity_id, old_state, new_state) events sent straight behind the get_states reply,
         # as HA does when a state changes while it answers
         self.state_changes_after_get_states: list[tuple[str, str | None, str | None]] = []
@@ -487,6 +491,9 @@ class FakeHAServer:
             case "config/area_registry/list":
                 await self._send_result(ws, msg_id, self.area_registry)
             case "call_service":
+                self.call_service_requested.set()
+                if self.call_service_gate is not None:
+                    await self.call_service_gate.wait()
                 if self.fail_service_calls:
                     await ws.send(
                         json.dumps(
