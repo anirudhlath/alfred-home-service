@@ -164,10 +164,10 @@ async def test_apply_credentials_idempotent_no_reconnect(
 
     Regression test for the credential re-push reconnect loop: core's
     credential_push_worker re-POSTs the stored HA creds to /credentials on every
-    ServiceRegistered event (every on_connect AND every 300s refresh_loop
-    re-register). If apply_credentials unconditionally tore down and reconnected,
-    that re-push would trigger on_connect again, re-register again, get re-pushed
-    again — forever. A steady auth_attempts count proves the loop is broken.
+    ServiceRegistered event (every on_connect re-register). If apply_credentials
+    unconditionally tore down and reconnected, that re-push would trigger on_connect
+    again, re-register again, get re-pushed again — forever. A steady auth_attempts
+    count proves the loop is broken.
     """
     state = await conn.apply_credentials(fake_ha.url, fake_ha.token)
     assert state == "connected"
@@ -207,3 +207,62 @@ async def test_apply_credentials_switches_servers(
         assert other.auth_attempts == 1
     finally:
         await other.stop()
+
+
+def _counting(conn: HAConnection) -> list[int]:
+    drops = [0]
+
+    async def on_disconnect() -> None:
+        drops[0] += 1
+
+    conn.add_disconnect_listener(on_disconnect)
+    return drops
+
+
+async def test_disconnect_listener_quiet_while_connected(
+    fake_ha: FakeHAServer, conn: HAConnection
+) -> None:
+    drops = _counting(conn)
+    await conn.apply_credentials(fake_ha.url, fake_ha.token)
+    assert drops[0] == 0
+
+
+async def test_disconnect_listener_fires_when_the_connection_drops(
+    fake_ha: FakeHAServer, conn: HAConnection
+) -> None:
+    drops = _counting(conn)
+    await conn.apply_credentials(fake_ha.url, fake_ha.token)
+    await fake_ha.drop_connections()
+    await eventually(lambda: drops[0] == 1)
+
+
+async def test_disconnect_listener_fires_when_the_token_is_rejected(
+    fake_ha: FakeHAServer, conn: HAConnection
+) -> None:
+    drops = _counting(conn)
+    assert await conn.apply_credentials(fake_ha.url, "wrong-token") == "auth_failed"
+    assert drops[0] == 1
+
+
+async def test_disconnect_listener_fires_when_ha_is_unreachable(conn: HAConnection) -> None:
+    drops = _counting(conn)
+    assert await conn.apply_credentials("http://127.0.0.1:1", "token") == "unreachable"
+    assert drops[0] >= 1
+
+
+async def test_a_failing_disconnect_listener_does_not_stop_reconnecting(
+    fake_ha: FakeHAServer, conn: HAConnection
+) -> None:
+    async def broken() -> None:
+        raise RuntimeError("boom")
+
+    connects = [0]
+
+    async def on_connect() -> None:
+        connects[0] += 1
+
+    conn.add_disconnect_listener(broken)
+    conn.add_connect_listener(on_connect)
+    await conn.apply_credentials(fake_ha.url, fake_ha.token)
+    await fake_ha.drop_connections()
+    await eventually(lambda: connects[0] == 2, timeout=3.0)

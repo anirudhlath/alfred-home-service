@@ -91,6 +91,7 @@ class HAConnection:
         self._state_listeners: list[StateListener] = []
         self._registry_listeners: list[VoidListener] = []
         self._connect_listeners: list[VoidListener] = []
+        self._disconnect_listeners: list[VoidListener] = []
 
     # ── listeners ──
 
@@ -102,6 +103,20 @@ class HAConnection:
 
     def add_connect_listener(self, cb: VoidListener) -> None:
         self._connect_listeners.append(cb)
+
+    def add_disconnect_listener(self, cb: VoidListener) -> None:
+        """Awaited when an established connection closes, or an attempt fails or is rejected.
+
+        Not called when stop() cancels the connection.
+        """
+        self._disconnect_listeners.append(cb)
+
+    async def _notify_disconnect(self) -> None:
+        for cb in self._disconnect_listeners:
+            try:
+                await cb()
+            except Exception:
+                logger.exception("disconnect listener failed")
 
     def last_event_age_s(self) -> float | None:
         if self._last_event_monotonic is None:
@@ -120,11 +135,11 @@ class HAConnection:
         Without this guard, every re-registration with Alfred's core (the SDK's
         `register()` unconditionally emits `ServiceRegistered`, which the core
         `credential_push_worker` answers by re-pushing the stored HA creds to
-        `POST /credentials` — this happens on every `on_connect` AND every 300s
-        refresh_loop re-register) would unconditionally tear down and reconnect
-        here, which fires `on_connect` again, which re-registers, which gets
-        re-pushed again — an infinite reconnect loop on the normal production
-        path (credentials saved once via the Settings UI).
+        `POST /credentials` — this happens on every on_connect re-register) would
+        unconditionally tear down and reconnect here, which fires `on_connect`
+        again, which re-registers, which gets re-pushed again — an infinite
+        reconnect loop on the normal production path (credentials saved once via
+        the Settings UI).
         """
         normalized = url.rstrip("/")
         if normalized == self._url and token == self._token and self.conn_state == "connected":
@@ -173,9 +188,11 @@ class HAConnection:
                         self._fail_pending()
                 self.conn_state = "unreachable"
                 logger.warning("HA WebSocket closed — reconnecting in {:.1f}s", backoff)
+                await self._notify_disconnect()
             except HAAuthError as exc:
                 self.conn_state = "auth_failed"
                 logger.error("HA rejected token ({}) — waiting for new credentials", exc)
+                await self._notify_disconnect()
                 self._attempt_done.set()
                 return
             except asyncio.CancelledError:
@@ -188,6 +205,7 @@ class HAConnection:
                     exc,
                     backoff,
                 )
+                await self._notify_disconnect()
             self._attempt_done.set()
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, self._max_backoff)
