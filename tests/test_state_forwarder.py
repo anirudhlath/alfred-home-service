@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import aiomqtt
 import pytest
 from alfred_sdk.events import StateChangedEvent
@@ -104,6 +106,40 @@ async def test_publish_loop_retries_after_mqtt_error(
     await eventually(lambda: len(fake.published) == 1)
     assert factory.attempts == 2
     await forwarder.stop()
+
+
+async def test_stop_passes_on_a_cancellation_aimed_at_its_caller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """stop() swallows its publish task's cancellation, never its own caller's."""
+    entered, cleaning, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    class _SlowToCancel(_FakeMqttClient):
+        async def publish(self, topic: str, payload: str) -> None:
+            entered.set()
+            try:
+                await release.wait()
+            finally:
+                cleaning.set()
+                await release.wait()  # cleanup that outlasts the cancel: stop() keeps awaiting
+
+    monkeypatch.setattr("app.state_forwarder.aiomqtt.Client", lambda host, port: _SlowToCancel())
+    forwarder = StateForwarder(host="broker", port=1883)
+    await forwarder.on_state_changed("light.a", "on", "off", {})
+    await forwarder.start()
+    try:
+        await asyncio.wait_for(entered.wait(), 3.0)
+        inner = forwarder._task
+        stopper = asyncio.create_task(forwarder.stop())
+        await asyncio.wait_for(cleaning.wait(), 3.0)
+        stopper.cancel()
+        await asyncio.wait([stopper], timeout=3.0)
+
+        assert stopper.cancelled()
+        assert inner is not None and inner.cancelled()
+    finally:
+        release.set()
+        await forwarder.stop()
 
 
 def test_env_defaults(monkeypatch: pytest.MonkeyPatch) -> None:

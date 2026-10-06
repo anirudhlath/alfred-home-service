@@ -6,7 +6,8 @@ with Alfred via the SDK.
 
 Alfred hears from this service on events only. It registers at startup, on each
 HA connect and when HA's registries change, and it writes live state as HA
-reports changes (Alfred issue #281). Nothing here runs on a timer.
+reports changes (Alfred issue #281). Nothing here runs on a schedule; only a
+failed registration is retried, with backoff.
 
 The /mcp JSON-RPC contract ({method, params, id} → {id, result, error}) is
 unchanged from Alfred HomeAgent's perspective.
@@ -33,9 +34,10 @@ from app.capability_generator import CapabilityGenerator
 from app.entity_index import EntityIndex
 from app.ha_connection import HAConnection
 from app.home_feature import HomeCapabilitiesContext, HomeCapabilitiesFeature
-from app.live_state import build_entry, build_snapshot
+from app.live_state import LiveStatePublisher
 from app.risk_map import RiskMap, load_reflex_config
 from app.state_forwarder import StateForwarder
+from app.tasks import cancel_and_wait
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
@@ -67,28 +69,6 @@ class CredentialsBody(BaseModel):
     token: str
 
 
-async def _cancel_and_wait(task: asyncio.Task[Any] | None) -> None:
-    """Cancel ``task`` and wait for it to end.
-
-    The task's own cancellation, or whatever it unwinds with, is expected and swallowed.
-    A cancellation aimed at our caller while it waits reaches the caller, as a
-    CancelledError even when the task unwound with something else.
-    """
-    if task is None:
-        return
-    # cancelling() counts every cancel ever requested of the caller, including ones it has
-    # already handled, so only a rise from here on is aimed at this wait (the idiom
-    # asyncio.timeout uses, as does HAConnection._stop_locked).
-    caller = asyncio.current_task()
-    cancelling_at_entry = caller.cancelling() if caller is not None else 0
-    task.cancel()
-    try:
-        await task
-    except BaseException as exc:
-        if caller is not None and caller.cancelling() > cancelling_at_entry:
-            raise asyncio.CancelledError() from exc
-
-
 async def _run_all(*steps: Callable[[], Awaitable[None]]) -> None:
     """Await each step in turn; a cancellation arriving part-way is raised after the last."""
     cancelled: asyncio.CancelledError | None = None
@@ -105,10 +85,10 @@ class Registrar:
     """Registers with Alfred on demand; a failed attempt retries until one lands.
 
     Not a refresh loop: once a registration succeeds, nothing stays scheduled. A
-    registration requested while a retry is pending runs at once, and its success
-    cancels the retry. This keeps a service started while Redis is unreachable from
-    staying unregistered — and Alfred pushes credentials only in answer to
-    ServiceRegistered.
+    registration requested while a retry is pending runs as soon as any attempt in
+    flight ends, and its success cancels the retry. This keeps a service started while
+    Redis is unreachable from staying unregistered — and Alfred pushes credentials only
+    in answer to ServiceRegistered.
     """
 
     def __init__(
@@ -122,6 +102,7 @@ class Registrar:
         self._initial_backoff = initial_backoff
         self._max_backoff = max_backoff
         self._retry: asyncio.Task[None] | None = None
+        self._attempt_lock = asyncio.Lock()
 
     async def register(self) -> None:
         if await self._attempt():
@@ -130,12 +111,17 @@ class Registrar:
             self._retry = asyncio.create_task(self._retry_until_registered(), name="register-retry")
 
     async def _attempt(self) -> bool:
-        try:
-            await self._client.register()
-        except Exception as exc:
-            logger.warning("Could not register with Alfred: {}", exc)
-            return False
-        return True
+        # One attempt at a time, in the order asked for (on_connect and a registry change
+        # can overlap). A success therefore lands after every attempt that started before
+        # it, so the stop() that follows cancels only a retry those left, never one a
+        # later failure scheduled for a newer manifest.
+        async with self._attempt_lock:
+            try:
+                await self._client.register()
+            except Exception as exc:
+                logger.warning("Could not register with Alfred: {}", exc)
+                return False
+            return True
 
     async def _retry_until_registered(self) -> None:
         delay = self._initial_backoff
@@ -150,7 +136,7 @@ class Registrar:
         # Let go of it before waiting: a registration that fails meanwhile then schedules
         # a retry of its own, which stays tracked instead of being dropped on our return.
         retry, self._retry = self._retry, None
-        await _cancel_and_wait(retry)
+        await cancel_and_wait(retry)
 
 
 def health_payload(conn: HAConnection, index: EntityIndex) -> dict[str, Any]:
@@ -191,32 +177,11 @@ def create_app() -> FastAPI:
         load_reflex_config(CONFIG_DIR / "reflex_tools.yaml"),
     )
 
-    async def clear_live_state() -> None:
-        try:
-            await live_state.clear()
-        except Exception as exc:
-            logger.warning("Could not clear live state: {}", exc)
-
-    async def on_state_changed(
-        entity_id: str,
-        old_state: str | None,
-        new_state: str | None,
-        attributes: dict[str, Any],
-    ) -> None:
-        # HAConnection applied the event to conn.states before calling us.
-        try:
-            state = conn.states.get(entity_id)
-            if state is None:  # HA deleted the entity
-                await live_state.remove(entity_id)
-                return
-            domain, kind, entry = build_entry(state, conn.services_catalog)
-            await live_state.update(domain, kind, entry)
-        except Exception as exc:
-            logger.warning("Live state update failed for {}: {}", entity_id, exc)
+    publisher = LiveStatePublisher(live_state, conn)
 
     conn.add_state_listener(forwarder.on_state_changed)
-    conn.add_state_listener(on_state_changed)
-    conn.add_disconnect_listener(clear_live_state)
+    conn.add_state_listener(publisher.on_state_changed)
+    conn.add_disconnect_listener(publisher.clear)
 
     async def rebuild_index() -> None:
         index.rebuild(
@@ -235,7 +200,7 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         # A process killed before it could clear on disconnect left its hash behind.
-        await clear_live_state()
+        await publisher.clear()
         # Register even with zero features so the credentials card appears in the UI.
         await registrar.register()
         await forwarder.start()
@@ -245,11 +210,11 @@ def create_app() -> FastAPI:
         # raised after the last. HA stops before the registrar and the final clear, so no
         # HA listener can schedule a registration retry or write live state after them.
         await _run_all(
-            lambda: _cancel_and_wait(env_task),
+            lambda: cancel_and_wait(env_task),
             forwarder.stop,
             conn.stop,
             registrar.stop,
-            clear_live_state,
+            publisher.clear,
             unregister,
             live_state.aclose,
         )
@@ -260,6 +225,7 @@ def create_app() -> FastAPI:
     app.state.client = client
     app.state.forwarder = forwarder
     app.state.live_state = live_state
+    app.state.live_state_publisher = publisher
     app.state.registrar = registrar
     app.state.capabilities_ready = False
 
@@ -280,13 +246,7 @@ def create_app() -> FastAPI:
                 "Reconnected to HA — capability set is frozen for this process; "
                 "restart if the HA instance or its service catalog changed"
             )
-        # Built and handed over with no await between, so the writer's FIFO lock
-        # orders it after every update requested before it.
-        snapshot = build_snapshot(conn.states, conn.services_catalog)
-        try:
-            await live_state.replace(snapshot)
-        except Exception as exc:
-            logger.warning("Could not publish live state: {}", exc)
+        await publisher.publish()
         await registrar.register()
 
     async def on_registries_updated() -> None:

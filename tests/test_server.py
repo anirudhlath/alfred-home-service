@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -11,11 +11,22 @@ import pytest
 from alfred_sdk.context import ContextEntry, ContextSnapshot
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from loguru import logger
 
 from app.server import CredentialsBody, Registrar, apply_env_credentials, create_app
 from tests.fake_ha import FakeHAServer, eventually
 
 _BOUND = 3.0  # seconds; bounds every wait, so a regression fails instead of hanging
+_WARNING = 30  # loguru's WARNING level number
+
+
+@pytest.fixture
+def logs() -> Iterator[list[Any]]:
+    """The loguru records emitted while the test runs."""
+    records: list[Any] = []
+    handler = logger.add(lambda message: records.append(message.record), level="DEBUG")
+    yield records
+    logger.remove(handler)
 
 
 @pytest.fixture
@@ -257,17 +268,21 @@ async def test_a_hundred_state_changes_register_nothing(
 
 
 async def test_a_failed_live_state_write_does_not_stop_forwarding(
-    connected_app: FastAPI, fake_ha: FakeHAServer
+    connected_app: FastAPI, fake_ha: FakeHAServer, logs: list[Any]
 ) -> None:
     live = connected_app.state.live_state
     live.update.side_effect = ConnectionError("redis down")
+    live.replace.side_effect = ConnectionError("redis down")
     await fake_ha.push_state_changed("light.bedroom_lamp", "on", "off")
     await fake_ha.push_state_changed("light.bedroom_lamp", "off", "on")
     # Both events still forwarded, both still offered to the writer: a failed write
     # costs that entity's freshness, never the listener chain.
     await eventually(lambda: connected_app.state.forwarder.pending_count() == 2)
-    await eventually(lambda: live.update.await_count == 2)
+    await eventually(lambda: live.update.await_count + live.replace.await_count == 1 + 2)
     assert connected_app.state.ha.states["light.bedroom_lamp"].state == "on"
+    # The live-state listener handles its own failures. HAConnection's isolation would
+    # also keep the chain going, but it logs a traceback per event: it must never see one.
+    assert [r for r in logs if "state listener failed" in r["message"]] == []
 
 
 async def test_disconnect_clears_live_state_and_reconnect_republishes(
@@ -277,6 +292,110 @@ async def test_disconnect_clears_live_state_and_reconnect_republishes(
     await fake_ha.drop_connections()
     await eventually(lambda: live.clear.await_count >= 1)
     await eventually(lambda: live.replace.await_count == 2, timeout=3.0)
+
+
+def _states(snapshot: ContextSnapshot) -> dict[str, str]:
+    return {
+        entry.entity_id: entry.state
+        for groups in (snapshot.controllable, snapshot.sensors)
+        for entries in groups.values()
+        for entry in entries
+    }
+
+
+def _live_state_logs(records: list[Any]) -> list[str]:
+    return [r["level"].name for r in records if r["name"] == "app.live_state"]
+
+
+@pytest.mark.parametrize("failed", ["update", "remove"])
+async def test_a_failed_write_heals_with_a_full_replace_then_updates_resume(
+    connected_app: FastAPI, fake_ha: FakeHAServer, logs: list[Any], failed: str
+) -> None:
+    """A write lost to a Redis outage (every alfred deploy restarts Redis) leaves that
+    entity wrong until it next changes, so the next event, whatever entity it is for,
+    republishes everything; once that lands, events go back to one entity each."""
+    live = connected_app.state.live_state
+    publisher = connected_app.state.live_state_publisher
+    getattr(live, failed).side_effect = ConnectionError("redis down")
+    lamp = "off" if failed == "update" else None  # None: HA deleted the entity
+    await fake_ha.push_state_changed("light.bedroom_lamp", "on", lamp)
+    await eventually(lambda: getattr(live, failed).await_count == 1)
+    assert publisher.dirty
+    getattr(live, failed).side_effect = None  # Redis is back
+
+    await fake_ha.push_state_changed("sensor.outdoor_temp", "20", "21")
+    await eventually(lambda: live.replace.await_count == 2)  # the connect one, then the heal
+    healed = _states(live.replace.await_args.args[0])
+    assert healed.get("light.bedroom_lamp") == lamp
+    assert healed["sensor.outdoor_temp"] == "21"
+    assert not publisher.dirty
+
+    updates = live.update.await_count
+    await fake_ha.push_state_changed("sensor.outdoor_temp", "21", "22")
+    await eventually(lambda: live.update.await_count == updates + 1)
+    assert live.replace.await_count == 2
+    assert _live_state_logs(logs) == ["WARNING", "INFO"]  # once going dirty, once healed
+
+
+async def test_a_failed_startup_clear_and_connect_replace_heal_on_the_next_event(
+    app: FastAPI, fake_ha: FakeHAServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Redis down at startup: the previous run's hash survives the failed clear and the
+    failed connect replace, underneath any update, until a replace lands."""
+    monkeypatch.delenv("HA_HOST", raising=False)
+    monkeypatch.delenv("HA_TOKEN", raising=False)
+    app.state.forwarder.start = AsyncMock()
+    app.state.forwarder.stop = AsyncMock()
+    live = app.state.live_state
+    publisher = app.state.live_state_publisher
+    live.clear.side_effect = ConnectionError("redis down")
+    live.replace.side_effect = [ConnectionError("redis down"), None]
+
+    async with app.router.lifespan_context(app):
+        assert publisher.dirty  # the failed startup clear alone marks it
+        assert await app.state.ha.apply_credentials(fake_ha.url, fake_ha.token) == "connected"
+        assert (live.clear.await_count, live.replace.await_count) == (1, 1)
+        assert publisher.dirty
+
+        await fake_ha.push_state_changed("light.bedroom_lamp", "on", "off")
+        await eventually(lambda: live.replace.await_count == 2)
+        assert _states(live.replace.await_args.args[0])["light.bedroom_lamp"] == "off"
+        assert not publisher.dirty
+        live.update.assert_not_awaited()
+
+
+async def test_a_failed_disconnect_clear_stays_dirty_until_the_reconnect_replace(
+    connected_app: FastAPI, fake_ha: FakeHAServer, logs: list[Any]
+) -> None:
+    live = connected_app.state.live_state
+    publisher = connected_app.state.live_state_publisher
+    live.clear.side_effect = ConnectionError("redis down")
+
+    await fake_ha.drop_connections()
+    await eventually(lambda: live.clear.await_count >= 1)
+    assert publisher.dirty
+
+    await eventually(lambda: live.replace.await_count == 2, timeout=_BOUND)  # reconnected
+    assert not publisher.dirty
+    assert _live_state_logs(logs) == ["WARNING", "INFO"]
+
+
+async def test_while_redis_stays_down_each_event_tries_one_replace_quietly(
+    connected_app: FastAPI, fake_ha: FakeHAServer, logs: list[Any]
+) -> None:
+    live = connected_app.state.live_state
+    live.update.side_effect = ConnectionError("redis down")
+    live.replace.side_effect = ConnectionError("redis down")
+    for i in range(3):
+        await fake_ha.push_state_changed("sensor.outdoor_temp", str(20 + i), str(21 + i))
+    await eventually(lambda: live.replace.await_count == 1 + 2)
+
+    assert live.update.await_count == 1  # the first event, before anything had failed
+    assert live.replace.await_count == 3  # the connect one, then one per event while dirty
+    assert connected_app.state.live_state_publisher.dirty
+    # One warning for the outage, from the publisher; nothing per event, from anyone.
+    assert len([r for r in logs if r["level"].no >= _WARNING]) == 1
+    assert _live_state_logs(logs) == ["WARNING"]
 
 
 class _FifoWriter:
@@ -601,19 +720,19 @@ async def test_a_registration_failing_while_stop_waits_keeps_its_retry() -> None
     client: Any = AsyncMock()
     client.register.side_effect = _registrations(
         ConnectionError("down"),  # a registration fails and schedules a retry...
-        attempt,  # ...which is in flight when...
-        None,  # ...another lands, so stop() cancels the retry and waits for it...
-        ConnectionError("down"),  # ...while a third fails
+        attempt,  # ...whose attempt is in flight when stop() cancels it and waits...
+        ConnectionError("down"),  # ...while another registration fails
     )
     registrar = Registrar(client, initial_backoff=0.01)
     try:
         await registrar.register()
         await asyncio.wait_for(entered.wait(), _BOUND)
-        landing = asyncio.create_task(registrar.register())
+        stopping = asyncio.create_task(registrar.stop())
         await asyncio.wait_for(cleaning.wait(), _BOUND)
-        await registrar.register()
+        failing = asyncio.create_task(registrar.register())
+        await asyncio.sleep(0.05)  # it gets as far as it can while the retry unwinds
         release.set()
-        await asyncio.wait_for(landing, _BOUND)
+        await asyncio.wait_for(asyncio.gather(stopping, failing), _BOUND)
 
         retry = registrar._retry
         assert retry is not None and not retry.done()
@@ -621,4 +740,36 @@ async def test_a_registration_failing_while_stop_waits_keeps_its_retry() -> None
         assert retry.cancelled()
     finally:
         release.set()
+        await registrar.stop()
+
+
+async def test_an_earlier_success_landing_last_keeps_a_later_failures_retry() -> None:
+    """Registrations run one at a time, in the order they were asked for.
+
+    on_connect and a registry change can register at once. Unserialised, the later one,
+    carrying the newer manifest, can fail first and schedule a retry, which the earlier
+    one's success then cancels when it lands: the older manifest would stay registered.
+    """
+    sent, reply = asyncio.Event(), asyncio.Event()
+
+    async def slow_success() -> None:
+        sent.set()
+        await reply.wait()
+
+    client: Any = AsyncMock()
+    client.register.side_effect = _registrations(slow_success, ConnectionError("down"))
+    registrar = Registrar(client, initial_backoff=10.0)
+    try:
+        earlier = asyncio.create_task(registrar.register())
+        await asyncio.wait_for(sent.wait(), _BOUND)
+        later = asyncio.create_task(registrar.register())
+        await asyncio.sleep(0.05)  # the later one gets as far as it can
+        reply.set()
+        await asyncio.wait_for(asyncio.gather(earlier, later), _BOUND)
+
+        assert client.register.await_count == 2
+        retry = registrar._retry
+        assert retry is not None and not retry.done()
+    finally:
+        reply.set()
         await registrar.stop()
