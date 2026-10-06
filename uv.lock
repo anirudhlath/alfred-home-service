@@ -21,7 +21,7 @@ wheels = [
 [[package]]
 name = "alfred-sdk"
 version = "0.1.0"
-source = { git = "https://github.com/anirudhlath/alfred.git?subdirectory=sdk&rev=dafcf02fdea4830c97bcd70e06742ccdee4720f0#dafcf02fdea4830c97bcd70e06742ccdee4720f0" }
+source = { git = "https://github.com/anirudhlath/alfred.git?subdirectory=sdk&rev=638c75d75135c89e65e74e7d1f2b46426cdb8fc8#638c75d75135c89e65e74e7d1f2b46426cdb8fc8" }
 dependencies = [
     { name = "pydantic" },
     { name = "redis" },
@@ -182,7 +182,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiomqtt", specifier = ">=2.0" },
-    { name = "alfred-sdk", git = "https://github.com/anirudhlath/alfred.git?subdirectory=sdk&rev=dafcf02fdea4830c97bcd70e06742ccdee4720f0" },
+    { name = "alfred-sdk", git = "https://github.com/anirudhlath/alfred.git?subdirectory=sdk&rev=638c75d75135c89e65e74e7d1f2b46426cdb8fc8" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "loguru", specifier = ">=0.7" },

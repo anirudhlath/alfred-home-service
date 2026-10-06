@@ -29,7 +29,7 @@ dev = [
 # (alfred#281); moved to alfred's merge commit once that PR lands. Switch to an alfred
 # release tag once one carries it.
 [tool.uv.sources]
-alfred-sdk = { git = "https://github.com/anirudhlath/alfred.git", rev = "dafcf02fdea4830c97bcd70e06742ccdee4720f0", subdirectory = "sdk" }
+alfred-sdk = { git = "https://github.com/anirudhlath/alfred.git", rev = "638c75d75135c89e65e74e7d1f2b46426cdb8fc8", subdirectory = "sdk" }
 
 [tool.setuptools.packages.find]
 include = ["app*", "alfred_ext*"]
