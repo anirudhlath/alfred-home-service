@@ -162,7 +162,7 @@ class LiveStatePublisher:
         self._dirty = True
         logger.warning(
             "Live state out of step with HA ({} failed: {}); "
-            "the next connect, state change or registration heals it",
+            "the next connect, state change, reconnect attempt or registration heals it",
             write,
             exc,
         )

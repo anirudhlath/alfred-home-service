@@ -6,8 +6,8 @@ with Alfred via the SDK.
 
 Alfred hears from this service on events only. It registers at startup, on each
 HA connect and when HA's registries change, and it writes live state as HA
-reports changes (Alfred issue #281). Nothing here runs on a schedule; only a
-failed registration is retried, with backoff.
+reports changes (Alfred issue #281). Nothing here runs on a schedule; only
+failed attempts (a registration, an HA connection) are retried, with backoff.
 
 The /mcp JSON-RPC contract ({method, params, id} → {id, result, error}) is
 unchanged from Alfred HomeAgent's perspective.
