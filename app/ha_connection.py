@@ -18,7 +18,6 @@ Design notes:
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import time
 from collections.abc import Awaitable, Callable
@@ -79,6 +78,7 @@ class HAConnection:
         self._next_msg_id = 1
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._attempt_done = asyncio.Event()
+        self._lifecycle_lock = asyncio.Lock()
 
         self.conn_state: ConnState = "disconnected"
         self.states: dict[str, HAEntityState] = {}
@@ -142,30 +142,49 @@ class HAConnection:
         production path (credentials saved once via the Settings UI).
         """
         normalized = url.rstrip("/")
-        if normalized == self._url and token == self._token and self.conn_state == "connected":
-            return self.conn_state
-        await self.stop()
-        self._url = normalized
-        self._token = token
-        self.conn_state = "disconnected"
-        self._attempt_done = asyncio.Event()
-        self._task = asyncio.create_task(self._run(), name="ha-connection")
-        await self._attempt_done.wait()
+        # Check, stop, swap and start as one critical section. Unserialised, two calls
+        # that overlap while an old task is being cancelled both stop that task, and the
+        # later one then overwrites the earlier one's new task without stopping it.
+        async with self._lifecycle_lock:
+            if normalized == self._url and token == self._token and self.conn_state == "connected":
+                return self.conn_state
+            await self._stop_locked()
+            self._url = normalized
+            self._token = token
+            attempt_done = self._attempt_done = asyncio.Event()
+            self._task = asyncio.create_task(self._run(), name="ha-connection")
+        # Wait outside the lock, so a newer apply_credentials or stop() can cancel this attempt.
+        await attempt_done.wait()
         return self.conn_state
 
     async def stop(self) -> None:
-        for task in (self._task, self._registry_refresh_task):
-            if task is not None and not task.done():
-                task.cancel()
-                with contextlib.suppress(BaseException):
+        """Cancel the connection; any apply_credentials caller still waiting returns."""
+        async with self._lifecycle_lock:
+            await self._stop_locked()
+
+    async def _stop_locked(self) -> None:
+        tasks = [t for t in (self._task, self._registry_refresh_task) if t and not t.done()]
+        for task in tasks:
+            task.cancel()
+        try:
+            for task in tasks:
+                try:
                     await task
-        self._task = None
-        self._registry_refresh_task = None
-        self._ws = None
-        # A cancelled attempt never sets this event, so release any apply_credentials
-        # caller still waiting on it — whether a newer apply_credentials or shutdown
-        # stopped us.
-        self._attempt_done.set()
+                except BaseException:
+                    # The task's own cancellation (or failure) is expected and swallowed.
+                    # A cancellation aimed at whoever called stop() must reach them.
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling():
+                        raise
+        finally:
+            self._task = None
+            self._registry_refresh_task = None
+            self._ws = None
+            self.conn_state = "disconnected"
+            # A cancelled attempt never sets this event, so release any apply_credentials
+            # caller still waiting on it, whether a newer apply_credentials or shutdown
+            # stopped us. The state is reset first, so that caller reads "disconnected".
+            self._attempt_done.set()
 
     def _ws_url(self) -> str:
         if self._url.startswith("https://"):

@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import pytest
 
-from app.ha_connection import HACommandError, HAConnection
+from app.ha_connection import HACommandError, HAConnection, VoidListener
 from tests.fake_ha import FakeHAServer, eventually
 
 
@@ -310,8 +310,8 @@ async def test_disconnect_listener_quiet_when_switching_servers(
 _BOUND = 3.0
 
 
-def _stalling(conn: HAConnection) -> tuple[asyncio.Event, asyncio.Event]:
-    """Register a disconnect listener that holds an attempt open until `release` is set.
+def _stalling(add: Callable[[VoidListener], None]) -> tuple[asyncio.Event, asyncio.Event]:
+    """Register, through `add`, a listener that holds an attempt open until `release` is set.
 
     Tests set `release` in a finally: if a regression re-enters the listener when the
     fixture's stop() cancels the connection, it then returns at once instead of
@@ -323,15 +323,19 @@ def _stalling(conn: HAConnection) -> tuple[asyncio.Event, asyncio.Event]:
         entered.set()
         await release.wait()
 
-    conn.add_disconnect_listener(stall)
+    add(stall)
     return entered, release
+
+
+def _live_connection_tasks() -> list[asyncio.Task[Any]]:
+    return [t for t in asyncio.all_tasks() if t.get_name() == "ha-connection" and not t.done()]
 
 
 async def test_a_superseded_apply_credentials_still_returns(
     fake_ha: FakeHAServer, conn: HAConnection
 ) -> None:
     """A second apply_credentials cancels the first attempt; the first caller must not hang."""
-    entered, release = _stalling(conn)
+    entered, release = _stalling(conn.add_disconnect_listener)
     try:
         first = asyncio.create_task(conn.apply_credentials(fake_ha.url, "wrong-token"))
         await asyncio.wait_for(entered.wait(), _BOUND)
@@ -340,7 +344,7 @@ async def test_a_superseded_apply_credentials_still_returns(
 
         assert second == "connected"
         # The superseded caller's attempt never finished, so it must not report success.
-        assert await asyncio.wait_for(first, _BOUND) != "connected"
+        assert await asyncio.wait_for(first, _BOUND) == "disconnected"
     finally:
         release.set()
 
@@ -349,13 +353,100 @@ async def test_stop_releases_a_pending_apply_credentials(
     fake_ha: FakeHAServer, conn: HAConnection
 ) -> None:
     """A bare stop() (shutdown) cancels the attempt; the waiting caller must not hang."""
-    entered, release = _stalling(conn)
+    entered, release = _stalling(conn.add_disconnect_listener)
     try:
         first = asyncio.create_task(conn.apply_credentials(fake_ha.url, "wrong-token"))
         await asyncio.wait_for(entered.wait(), _BOUND)
 
         await asyncio.wait_for(conn.stop(), _BOUND)
 
-        assert await asyncio.wait_for(first, _BOUND) != "connected"
+        assert await asyncio.wait_for(first, _BOUND) == "disconnected"
+    finally:
+        release.set()
+
+
+async def test_stop_while_connect_listeners_run_reports_disconnected(
+    fake_ha: FakeHAServer, conn: HAConnection
+) -> None:
+    """conn_state is already "connected" while connect listeners run; stop() there resets it."""
+    entered, release = _stalling(conn.add_connect_listener)
+    try:
+        first = asyncio.create_task(conn.apply_credentials(fake_ha.url, fake_ha.token))
+        await asyncio.wait_for(entered.wait(), _BOUND)
+        assert conn.conn_state == "connected"
+
+        await asyncio.wait_for(conn.stop(), _BOUND)
+
+        assert conn.conn_state == "disconnected"
+        assert await asyncio.wait_for(first, _BOUND) == "disconnected"
+    finally:
+        release.set()
+
+
+async def test_reapplying_the_same_credentials_after_stop_reconnects(
+    fake_ha: FakeHAServer, conn: HAConnection
+) -> None:
+    await asyncio.wait_for(conn.apply_credentials(fake_ha.url, fake_ha.token), _BOUND)
+    await asyncio.wait_for(conn.stop(), _BOUND)
+
+    state = await asyncio.wait_for(conn.apply_credentials(fake_ha.url, fake_ha.token), _BOUND)
+
+    assert state == "connected"
+    assert fake_ha.auth_attempts == 2  # a real reconnect, not the idempotency no-op
+    assert len(_live_connection_tasks()) == 1
+
+
+async def test_overlapping_apply_credentials_leave_one_connection(
+    fake_ha: FakeHAServer, conn: HAConnection
+) -> None:
+    """B and C both supersede A while A's task is still being cancelled.
+
+    Unserialised, both stop A, B starts its task, and C then overwrites B's task without
+    stopping it: two connection loops run, and the fixture's stop() reaches only one.
+    """
+    entered, release = _stalling(conn.add_disconnect_listener)
+    try:
+        a = asyncio.create_task(conn.apply_credentials(fake_ha.url, "wrong-token"))
+        await asyncio.wait_for(entered.wait(), _BOUND)
+
+        b = asyncio.create_task(conn.apply_credentials(fake_ha.url, fake_ha.token))
+        c = asyncio.create_task(conn.apply_credentials(fake_ha.url, fake_ha.token))
+        state_a, _, state_c = await asyncio.wait_for(asyncio.gather(a, b, c), _BOUND)
+
+        assert state_a != "connected"
+        assert state_c == "connected"
+        assert len(_live_connection_tasks()) == 1
+    finally:
+        release.set()
+
+
+async def test_cancelling_a_stop_caller_propagates(
+    fake_ha: FakeHAServer, conn: HAConnection
+) -> None:
+    """stop() swallows its connection task's cancellation, never its own caller's."""
+    entered, cleaning, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def slow_to_cancel() -> None:
+        entered.set()
+        try:
+            await release.wait()
+        finally:
+            cleaning.set()
+            await release.wait()  # cleanup that outlasts the cancel: stop() keeps awaiting
+
+    conn.add_disconnect_listener(slow_to_cancel)
+    try:
+        first = asyncio.create_task(conn.apply_credentials(fake_ha.url, "wrong-token"))
+        await asyncio.wait_for(entered.wait(), _BOUND)
+        (inner,) = _live_connection_tasks()
+
+        stopper = asyncio.create_task(conn.stop())
+        await asyncio.wait_for(cleaning.wait(), _BOUND)
+        stopper.cancel()
+        await asyncio.wait([stopper, inner], timeout=_BOUND)
+
+        assert stopper.cancelled()
+        assert inner.cancelled()
+        assert await asyncio.wait_for(first, _BOUND) == "disconnected"
     finally:
         release.set()
