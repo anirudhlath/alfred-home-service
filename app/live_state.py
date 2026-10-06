@@ -78,10 +78,11 @@ class LiveStatePublisher:
     to heal), when an empty hash is the right one. Nothing here runs on a schedule.
 
     A heal replaces only while HA reports "connected", which HAConnection sets once a
-    connection's fresh states are in. Until then conn.states still holds the previous
-    connection's states, while state events already flow and the registration path is
-    never cancelled. The disconnect's clear is requested only after that flag drops, so
-    a replace handed over while it was up lands before the clear.
+    connection's setup has fetched everything a snapshot reads. Until then conn.states
+    (before the get_states reply), or the service catalog (until get_services answers),
+    may still be the previous connection's, while state events already flow and the
+    registration path is never cancelled. The disconnect's clear is requested only after
+    that flag drops, so a replace handed over while it was up lands before the clear.
     """
 
     def __init__(self, writer: LiveStateWriter, conn: HAConnection) -> None:
