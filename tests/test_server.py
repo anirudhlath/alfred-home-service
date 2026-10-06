@@ -603,19 +603,30 @@ async def test_a_registration_landing_while_clean_writes_nothing(
     assert {name: getattr(live, name).await_count for name in writes} == before
 
 
+async def _connect_with_no_reconnect_attempt_in_the_test(
+    app: FastAPI, fake_ha: FakeHAServer
+) -> None:
+    """Connect with a backoff longer than any test, so once HA goes away no reconnect
+    attempt's disconnect clear can land while the test counts writes. HAConnection reads
+    the backoff as it connects, so it is set first."""
+    app.state.ha._initial_backoff = 3600.0
+    assert await app.state.ha.apply_credentials(fake_ha.url, fake_ha.token) == "connected"
+
+
 async def test_a_registration_landing_after_a_drop_clears_rather_than_republishes(
-    connected_app: FastAPI, fake_ha: FakeHAServer
+    app: FastAPI, fake_ha: FakeHAServer
 ) -> None:
     """The registration path is not cancelled on disconnect: a heal from it after the
     drop must not bring back the gone connection's states."""
-    live = connected_app.state.live_state
-    publisher = connected_app.state.live_state_publisher
+    await _connect_with_no_reconnect_attempt_in_the_test(app, fake_ha)
+    live = app.state.live_state
+    publisher = app.state.live_state_publisher
     _fail_once(live.clear)  # the disconnect's clear is lost
     await fake_ha.stop()  # HA goes away and stays away
     await eventually(lambda: live.clear.await_count == 1)
     assert publisher.dirty
 
-    await connected_app.state.registrar.register()
+    await app.state.registrar.register()
 
     assert live.replace.await_count == 1  # only the connect one
     assert live.clear.await_count == 2  # the disconnect's, then the heal's
@@ -623,12 +634,13 @@ async def test_a_registration_landing_after_a_drop_clears_rather_than_republishe
 
 
 async def test_a_disconnect_clear_that_lands_leaves_the_hash_clean(
-    connected_app: FastAPI, fake_ha: FakeHAServer, logs: list[Any]
+    app: FastAPI, fake_ha: FakeHAServer, logs: list[Any]
 ) -> None:
     """An empty hash is right while HA is away, so a clear that lands heals as a replace
     does, and leaves a registration nothing to do."""
-    live = connected_app.state.live_state
-    publisher = connected_app.state.live_state_publisher
+    await _connect_with_no_reconnect_attempt_in_the_test(app, fake_ha)
+    live = app.state.live_state
+    publisher = app.state.live_state_publisher
     _make_dirty(live)
     await fake_ha.push_state_changed("light.bedroom_lamp", "on", "off")
     await eventually(lambda: publisher.dirty)
@@ -638,7 +650,7 @@ async def test_a_disconnect_clear_that_lands_leaves_the_hash_clean(
 
     writes = ("replace", "update", "remove", "clear")
     before = {name: getattr(live, name).await_count for name in writes}
-    await connected_app.state.registrar.register()
+    await app.state.registrar.register()
 
     assert {name: getattr(live, name).await_count for name in writes} == before
     assert _live_state_logs(logs) == ["WARNING", "INFO"]
