@@ -41,10 +41,10 @@ Alfred hears from this service on events:
 | Shutdown | `clear()`, then the writer's `aclose()` last | `unregister()`, between the two |
 
 Any failed live-state write marks the hash dirty (one WARNING); any `replace()` or
-`clear()` that lands marks it clean again (one INFO). One double fault never heals on its
-own: HA away *and* the disconnect's `clear()` failed — the hash keeps the last state until
-HA reconnects or the service restarts (or a registration retry already pending when Redis
-returns).
+`clear()` that lands marks it clean again (one INFO). One double fault does not heal on
+the next event: HA away *and* the disconnect's `clear()` failed. No state event arrives,
+so the hash keeps the last state until HA reconnects, the service restarts, or a
+registration retry that was already pending lands once Redis returns.
 
 Registrations are serialised (one attempt at a time, in the order asked for). A failed
 one retries with backoff (1 s doubling to 60 s); once one lands, nothing stays scheduled.
