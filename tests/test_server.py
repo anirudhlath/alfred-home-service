@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from alfred_sdk.context import ContextEntry, ContextSnapshot
@@ -225,6 +225,27 @@ async def test_connect_publishes_live_state_then_registers(
     assert lamps["light.bedroom_lamp"].state == "on"
 
 
+@pytest.mark.parametrize("failing", ["index", "capabilities"])
+async def test_connect_publishes_before_anything_that_can_fail(
+    app: FastAPI, fake_ha: FakeHAServer, monkeypatch: pytest.MonkeyPatch, failing: str
+) -> None:
+    """A credential swap stops the old connection without a disconnect clear, so the new
+    connection's replace is all that retires the old instance's entries. It reads only
+    HA's states and service catalog, so a failure building the index or the tool surface
+    must not cost it."""
+    owner, name = {
+        "index": (app.state.index, "rebuild"),
+        "capabilities": (app.state.client, "discover_features_from_classes"),
+    }[failing]
+    monkeypatch.setattr(owner, name, Mock(side_effect=RuntimeError("boom")))
+
+    assert await app.state.ha.apply_credentials(fake_ha.url, fake_ha.token) == "connected"
+
+    live = app.state.live_state
+    live.replace.assert_awaited_once()
+    assert _states(live.replace.await_args.args[0])["light.bedroom_lamp"] == "on"
+
+
 async def test_a_state_change_updates_one_entity(
     connected_app: FastAPI, fake_ha: FakeHAServer
 ) -> None:
@@ -369,6 +390,8 @@ async def test_a_failed_startup_clear_and_connect_replace_heal_on_the_next_event
 async def test_a_failed_disconnect_clear_stays_dirty_until_the_reconnect_replace(
     connected_app: FastAPI, fake_ha: FakeHAServer, logs: list[Any]
 ) -> None:
+    """A clear that lands would heal it too; here every clear fails, so only the
+    reconnect's replace can."""
     live = connected_app.state.live_state
     publisher = connected_app.state.live_state_publisher
     live.clear.side_effect = ConnectionError("redis down")
@@ -400,14 +423,18 @@ async def test_while_redis_stays_down_each_event_tries_one_replace_quietly(
     assert _live_state_logs(logs) == ["WARNING"]
 
 
-def _make_dirty(live: Any) -> None:
-    """The next update fails (Redis drops it), then Redis is back for everything after."""
+def _fail_once(write: AsyncMock) -> None:
+    """The next call fails (Redis drops it), then Redis is back for everything after."""
 
     def fail_once(*_: object) -> None:
-        live.update.side_effect = None
+        write.side_effect = None
         raise ConnectionError("redis down")
 
-    live.update.side_effect = fail_once
+    write.side_effect = fail_once
+
+
+def _make_dirty(live: Any) -> None:
+    _fail_once(live.update)
 
 
 async def test_a_heal_waits_for_the_fresh_states_after_a_reconnect(
@@ -418,9 +445,6 @@ async def test_a_heal_waits_for_the_fresh_states_after_a_reconnect(
     republish the old connection's states and call the hash whole."""
     live = connected_app.state.live_state
     publisher = connected_app.state.live_state_publisher
-    _make_dirty(live)
-    await fake_ha.push_state_changed("sensor.outdoor_temp", "20", "21")
-    await eventually(lambda: publisher.dirty)
     replaces = live.replace.await_count
 
     # HA restarts with the lamp now off, and holds its get_states answer on the reconnect.
@@ -430,12 +454,15 @@ async def test_a_heal_waits_for_the_fresh_states_after_a_reconnect(
     ]
     fake_ha.get_states_requested.clear()
     gate = fake_ha.get_states_gate = asyncio.Event()
+    _fail_once(live.clear)  # the disconnect's clear is lost, so the window opens dirty
     try:
         await fake_ha.drop_connections()
         await asyncio.wait_for(fake_ha.get_states_requested.wait(), _BOUND)
+        assert publisher.dirty
         writes = live.update.await_count + live.replace.await_count
-        await fake_ha.push_state_changed("sensor.outdoor_temp", "21", "22")
+        await fake_ha.push_state_changed("sensor.outdoor_temp", "20", "21")
         await eventually(lambda: live.update.await_count + live.replace.await_count > writes)
+        assert publisher.dirty  # one entity's update makes nothing whole
         gate.set()
         await eventually(lambda: not publisher.dirty)
     finally:
@@ -478,7 +505,26 @@ async def test_a_registration_landing_after_a_drop_clears_rather_than_republishe
     connected_app: FastAPI, fake_ha: FakeHAServer
 ) -> None:
     """The registration path is not cancelled on disconnect: a heal from it after the
-    disconnect's clear must not bring back the gone connection's states."""
+    drop must not bring back the gone connection's states."""
+    live = connected_app.state.live_state
+    publisher = connected_app.state.live_state_publisher
+    _fail_once(live.clear)  # the disconnect's clear is lost
+    await fake_ha.stop()  # HA goes away and stays away
+    await eventually(lambda: live.clear.await_count == 1)
+    assert publisher.dirty
+
+    await connected_app.state.registrar.register()
+
+    assert live.replace.await_count == 1  # only the connect one
+    assert live.clear.await_count == 2  # the disconnect's, then the heal's
+    assert not publisher.dirty
+
+
+async def test_a_disconnect_clear_that_lands_leaves_the_hash_clean(
+    connected_app: FastAPI, fake_ha: FakeHAServer, logs: list[Any]
+) -> None:
+    """An empty hash is right while HA is away, so a clear that lands heals as a replace
+    does, and leaves a registration nothing to do."""
     live = connected_app.state.live_state
     publisher = connected_app.state.live_state_publisher
     _make_dirty(live)
@@ -486,12 +532,14 @@ async def test_a_registration_landing_after_a_drop_clears_rather_than_republishe
     await eventually(lambda: publisher.dirty)
     await fake_ha.stop()  # HA goes away and stays away
     await eventually(lambda: live.clear.await_count == 1)
+    assert not publisher.dirty
 
+    writes = ("replace", "update", "remove", "clear")
+    before = {name: getattr(live, name).await_count for name in writes}
     await connected_app.state.registrar.register()
 
-    assert live.replace.await_count == 1  # only the connect one
-    assert live.clear.await_count == 2  # the disconnect's, then the heal's
-    assert not publisher.dirty
+    assert {name: getattr(live, name).await_count for name in writes} == before
+    assert _live_state_logs(logs) == ["WARNING", "INFO"]
 
 
 async def test_a_failed_heal_keeps_the_hash_dirty_without_another_warning(
@@ -941,6 +989,37 @@ async def test_the_registered_hook_runs_once_per_registration_that_lands() -> No
     assert landed == 2
     assert client.register.await_count == 3
     await registrar.stop()
+
+
+async def test_a_registration_failing_during_the_retrys_hook_gets_a_retry_of_its_own() -> None:
+    """A retry that lands lets go of itself before its hook runs. A registration failing
+    while that heal writes would otherwise find the retry still pending and schedule
+    nothing, and the retry would then end: its newer manifest never registered."""
+    in_hook, release = asyncio.Event(), asyncio.Event()
+    hooks = 0
+
+    async def on_registered() -> None:
+        nonlocal hooks
+        hooks += 1
+        if hooks == 1:
+            in_hook.set()
+            await release.wait()  # a heal writing to Redis
+
+    client: Any = AsyncMock()
+    client.register.side_effect = [ConnectionError("down"), None, ConnectionError("down"), None]
+    registrar = Registrar(client, initial_backoff=0.01, on_registered=on_registered)
+    try:
+        await registrar.register()  # fails, schedules a retry
+        await asyncio.wait_for(in_hook.wait(), _BOUND)  # the retry landed; its heal runs
+        await registrar.register()  # fails meanwhile
+        release.set()
+        await eventually(lambda: hooks == 2)  # its own retry lands, and heals
+
+        assert client.register.await_count == 4
+        assert registrar._retry is None
+    finally:
+        release.set()
+        await registrar.stop()
 
 
 async def test_a_failing_registered_hook_does_not_fail_the_registration(

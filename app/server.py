@@ -132,6 +132,10 @@ class Registrar:
         while True:
             await asyncio.sleep(delay)
             if await self._attempt():
+                # Let go of ourselves before the hook, as a direct success's stop() does: a
+                # registration failing while the hook runs must schedule a retry of its own.
+                if self._retry is asyncio.current_task():
+                    self._retry = None
                 await self._registered()
                 return
             delay = min(delay * 2, self._max_backoff)
@@ -243,6 +247,10 @@ def create_app() -> FastAPI:
     app.state.capabilities_ready = False
 
     async def on_connect() -> None:
+        # First, so a failure below cannot cost it: after a credential swap, which clears
+        # nothing, this replace is all that retires the old instance's entries. It reads
+        # only conn.states and conn.services_catalog, never the index.
+        await publisher.publish()
         await rebuild_index()
         if not app.state.capabilities_ready:
             specs = generator.generate(conn.services_catalog, index)
@@ -259,7 +267,6 @@ def create_app() -> FastAPI:
                 "Reconnected to HA — capability set is frozen for this process; "
                 "restart if the HA instance or its service catalog changed"
             )
-        await publisher.publish()
         await registrar.register()
 
     async def on_registries_updated() -> None:

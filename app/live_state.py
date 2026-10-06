@@ -71,8 +71,10 @@ class LiveStatePublisher:
     hash that a failed clear left behind survives underneath fresh updates. So any failed
     write marks the hash dirty, and heal() makes it whole again: a full replace from a live
     connection, or a clear when HA is not connected. It runs on the next state change and
-    when a registration lands, which proves Redis reachable. A heal that lands clears the
-    flag, as does the connect replace. Nothing here runs on a schedule.
+    when a registration lands, which proves Redis reachable. Any replace or clear that
+    lands clears the flag, in the order they land: a clear is only asked for while HA is
+    not connected (at startup, on disconnect, at shutdown, or to heal), when an empty hash
+    is the right one. Nothing here runs on a schedule.
 
     A heal replaces only while HA reports "connected", which HAConnection sets once a
     connection's fresh states are in. Until then conn.states still holds the previous
@@ -88,7 +90,7 @@ class LiveStatePublisher:
 
     @property
     def dirty(self) -> bool:
-        """A write failed and no replace has landed since."""
+        """A write failed and no replace or clear has landed since."""
         return self._dirty
 
     async def publish(self) -> None:
@@ -109,13 +111,8 @@ class LiveStatePublisher:
             return
         if self._conn.conn_state == "connected":
             await self.publish()
-            return
-        try:
-            await self._writer.clear()
-        except Exception as exc:
-            self._failed("clear", exc)
-            return
-        self._healed("cleared while HA is not connected")
+        else:
+            await self.clear()
 
     async def on_state_changed(
         self,
@@ -139,11 +136,13 @@ class LiveStatePublisher:
             self._failed(f"write of {entity_id}", exc)
 
     async def clear(self) -> None:
-        """Drop the whole hash (at startup, on disconnect, at shutdown)."""
+        """Drop the whole hash (at startup, on disconnect, at shutdown, and to heal)."""
         try:
             await self._writer.clear()
         except Exception as exc:
             self._failed("clear", exc)
+            return
+        self._healed("cleared while HA is not connected")
 
     def _healed(self, how: str) -> None:
         if self._dirty:
