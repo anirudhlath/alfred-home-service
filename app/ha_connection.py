@@ -27,6 +27,8 @@ from loguru import logger
 from pydantic import BaseModel, Field
 from websockets.asyncio.client import ClientConnection, connect
 
+from app.tasks import cancel_and_wait
+
 ConnState = Literal["connected", "auth_failed", "unreachable", "disconnected"]
 
 StateListener = Callable[[str, str | None, str | None, dict[str, Any]], Awaitable[None]]
@@ -214,8 +216,13 @@ class HAConnection:
                         async for raw in ws:
                             await self._handle_message(json.loads(raw))
                     finally:
-                        setup.cancel()
                         self._ws = None
+                        # Wait for the setup to end, so the disconnect listeners below run
+                        # after anything its connect listeners were writing, not alongside
+                        # it. Cancelled before its pending command is failed, it unwinds
+                        # as cancelled, not as a failed setup. A cancel aimed at us while we
+                        # wait still reaches us (see cancel_and_wait).
+                        await cancel_and_wait(setup)
                         self._fail_pending()
                 self.conn_state = "unreachable"
                 logger.warning("HA WebSocket closed — reconnecting in {:.1f}s", backoff)

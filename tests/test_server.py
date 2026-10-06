@@ -729,9 +729,9 @@ async def test_a_drop_while_the_connect_snapshot_is_pending_ends_cleared(
 ) -> None:
     """HA drops while on_connect's replace() is mid-write, or queued behind another write.
 
-    HAConnection cancels the connect setup without awaiting it, then runs the disconnect
-    listeners. The snapshot may land before the clear (the writer is FIFO), never after
-    it: live state must end empty, not showing a connection that is gone.
+    HAConnection cancels the connect setup and waits for it to end, then runs the
+    disconnect listeners. The snapshot may land before the clear (the writer is FIFO),
+    never after it: live state must end empty, not showing a connection that is gone.
     """
     writer = _FifoWriter()
     app.state.live_state.replace = writer.replace
