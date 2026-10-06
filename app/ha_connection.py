@@ -221,9 +221,8 @@ class HAConnection:
                         self._ws = None
                         # Wait for the setup to end, so the disconnect listeners below run
                         # after anything its connect listeners were writing, not alongside
-                        # it. Cancelled before its pending command is failed, it unwinds
-                        # as cancelled, not as a failed setup. A cancel aimed at us while we
-                        # wait still reaches us (see cancel_and_wait).
+                        # it. A cancel aimed at us while we wait still reaches us (see
+                        # cancel_and_wait).
                         await cancel_and_wait(setup)
                         self._fail_pending()
                 self.conn_state = "unreachable"
