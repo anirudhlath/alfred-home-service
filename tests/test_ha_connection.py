@@ -331,6 +331,39 @@ def _live_connection_tasks() -> list[asyncio.Task[Any]]:
     return [t for t in asyncio.all_tasks() if t.get_name() == "ha-connection" and not t.done()]
 
 
+class _Unwound(BaseException):
+    """Escapes _notify_disconnect, which isolates listeners from Exception only."""
+
+
+def _slow_to_cancel(
+    conn: HAConnection, unwind_as: type[BaseException] | None = None
+) -> tuple[asyncio.Event, asyncio.Event, asyncio.Event]:
+    """Register a disconnect listener whose cleanup outlasts a cancel; return its events.
+
+    The listener sets `entered` and holds its attempt open. Once its task is cancelled it
+    sets `cleaning` and keeps awaiting `release`, so whoever cancelled the task is left
+    awaiting it. A second cancel ends that cleanup, with a CancelledError or `unwind_as`.
+    Tests set `release` in a finally, as with `_stalling`.
+    """
+    entered, cleaning, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def slow_to_cancel() -> None:
+        entered.set()
+        try:
+            await release.wait()
+        finally:
+            cleaning.set()
+            try:
+                await release.wait()  # cleanup that outlasts the cancel: stop() keeps awaiting
+            except asyncio.CancelledError:
+                if unwind_as is None:
+                    raise
+                raise unwind_as from None
+
+    conn.add_disconnect_listener(slow_to_cancel)
+    return entered, cleaning, release
+
+
 async def test_a_superseded_apply_credentials_still_returns(
     fake_ha: FakeHAServer, conn: HAConnection
 ) -> None:
@@ -424,17 +457,7 @@ async def test_cancelling_a_stop_caller_propagates(
     fake_ha: FakeHAServer, conn: HAConnection
 ) -> None:
     """stop() swallows its connection task's cancellation, never its own caller's."""
-    entered, cleaning, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
-
-    async def slow_to_cancel() -> None:
-        entered.set()
-        try:
-            await release.wait()
-        finally:
-            cleaning.set()
-            await release.wait()  # cleanup that outlasts the cancel: stop() keeps awaiting
-
-    conn.add_disconnect_listener(slow_to_cancel)
+    entered, cleaning, release = _slow_to_cancel(conn)
     try:
         first = asyncio.create_task(conn.apply_credentials(fake_ha.url, "wrong-token"))
         await asyncio.wait_for(entered.wait(), _BOUND)
@@ -448,5 +471,82 @@ async def test_cancelling_a_stop_caller_propagates(
         assert stopper.cancelled()
         assert inner.cancelled()
         assert await asyncio.wait_for(first, _BOUND) == "disconnected"
+    finally:
+        release.set()
+
+
+async def test_a_cancelled_stop_caller_gets_cancelled_error_whatever_the_task_raised(
+    fake_ha: FakeHAServer, conn: HAConnection
+) -> None:
+    """The caller's cancel reaches the task, which may unwind with something else entirely."""
+    entered, cleaning, release = _slow_to_cancel(conn, unwind_as=_Unwound)
+    try:
+        first = asyncio.create_task(conn.apply_credentials(fake_ha.url, "wrong-token"))
+        await asyncio.wait_for(entered.wait(), _BOUND)
+        (inner,) = _live_connection_tasks()
+
+        stopper = asyncio.create_task(conn.stop())
+        await asyncio.wait_for(cleaning.wait(), _BOUND)
+        stopper.cancel()
+        await asyncio.wait([stopper, inner], timeout=_BOUND)
+
+        assert isinstance(inner.exception(), _Unwound)
+        assert stopper.cancelled()
+        assert await asyncio.wait_for(first, _BOUND) == "disconnected"
+    finally:
+        release.set()
+
+
+async def test_stop_ignores_a_cancellation_its_caller_already_handled(
+    fake_ha: FakeHAServer, conn: HAConnection
+) -> None:
+    """cancelling() counts every cancel ever requested; only a rise during stop() is live."""
+    await asyncio.wait_for(conn.apply_credentials(fake_ha.url, fake_ha.token), _BOUND)
+    waiting = asyncio.Event()
+
+    async def handle_a_cancel_then_stop() -> int:
+        try:
+            waiting.set()
+            await asyncio.sleep(_BOUND)
+        except asyncio.CancelledError:
+            pass  # handled, without uncancel(): the count stays at 1
+        await conn.stop()
+        task = asyncio.current_task()
+        assert task is not None
+        return task.cancelling()
+
+    caller = asyncio.create_task(handle_a_cancel_then_stop())
+    await asyncio.wait_for(waiting.wait(), _BOUND)
+    caller.cancel()
+    await asyncio.wait([caller], timeout=_BOUND)
+
+    assert not caller.cancelled()
+    assert caller.result() == 1
+    assert conn.conn_state == "disconnected"
+    assert _live_connection_tasks() == []
+
+
+async def test_a_bare_stop_waits_for_an_apply_credentials_mid_stop(
+    fake_ha: FakeHAServer, conn: HAConnection
+) -> None:
+    """B's apply_credentials is inside its own stop of A when a bare stop() arrives.
+
+    Unlocked, that stop() finishes after B has started its new task and drops the only
+    reference to it: B's connection loop runs on, and no later stop() can reach it.
+    """
+    entered, cleaning, release = _slow_to_cancel(conn)
+    try:
+        a = asyncio.create_task(conn.apply_credentials(fake_ha.url, "wrong-token"))
+        await asyncio.wait_for(entered.wait(), _BOUND)
+        b = asyncio.create_task(conn.apply_credentials(fake_ha.url, fake_ha.token))
+        await asyncio.wait_for(cleaning.wait(), _BOUND)  # B now awaits A's task, inside the lock
+
+        stopper = asyncio.create_task(conn.stop())
+        await asyncio.sleep(0)  # the stopper reaches the lock
+        release.set()
+        _, state_b, _ = await asyncio.wait_for(asyncio.gather(a, b, stopper), _BOUND)
+
+        assert state_b == "disconnected"
+        assert _live_connection_tasks() == []
     finally:
         release.set()

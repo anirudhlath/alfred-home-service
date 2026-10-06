@@ -163,6 +163,11 @@ class HAConnection:
             await self._stop_locked()
 
     async def _stop_locked(self) -> None:
+        # cancelling() counts every cancel ever requested of the caller, including ones it
+        # has already handled, so only a rise from here on is aimed at this stop (the idiom
+        # asyncio.timeout uses). A cancel while waiting for the lock raises from acquire().
+        caller = asyncio.current_task()
+        cancelling_at_entry = caller.cancelling() if caller is not None else 0
         tasks = [t for t in (self._task, self._registry_refresh_task) if t and not t.done()]
         for task in tasks:
             task.cancel()
@@ -170,12 +175,12 @@ class HAConnection:
             for task in tasks:
                 try:
                     await task
-                except BaseException:
+                except BaseException as exc:
                     # The task's own cancellation (or failure) is expected and swallowed.
-                    # A cancellation aimed at whoever called stop() must reach them.
-                    current = asyncio.current_task()
-                    if current is not None and current.cancelling():
-                        raise
+                    # A cancellation aimed at whoever called stop() must reach them, as a
+                    # CancelledError even when the task unwound with something else.
+                    if caller is not None and caller.cancelling() > cancelling_at_entry:
+                        raise asyncio.CancelledError() from exc
         finally:
             self._task = None
             self._registry_refresh_task = None
