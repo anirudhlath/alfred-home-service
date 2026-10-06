@@ -13,8 +13,9 @@ uv run uvicorn app.server:app --port 8000
 
 Requires a `.env` (python-dotenv loads it — `os.getenv` alone does NOT): `HA_HOST`,
 `HA_TOKEN` for the Home Assistant instance. Never commit `.env` (already gitignored).
-Without Redis/Alfred reachable, the service still boots and serves `/health` — tool
-registration with Alfred's registry just logs a warning and retries on its next refresh.
+Without Redis/Alfred reachable, the service still boots and serves `/health` —
+registration with Alfred logs a warning and retries with backoff (1 s doubling to 60 s)
+until it lands.
 
 ## Test / lint / type
 
@@ -23,6 +24,38 @@ uv run ruff check . && uv run ruff format --check .
 uv run mypy app/ alfred_ext/
 uv run pytest -q
 ```
+
+## Alfred lifecycle (alfred#281)
+
+Nothing here runs on a schedule; only a failed registration is retried, with backoff.
+Alfred hears from this service on events:
+
+| Moment | Live state (`LiveStatePublisher`) | Registration (`Registrar`) |
+|---|---|---|
+| Startup | `clear()` (a killed run may have left its hash) | `register()` |
+| HA connected | rebuild the entity index, then a full `replace()` from `conn.states` — published even if the rebuild fails | then generate capabilities (first connect only), then `register()` |
+| HA `state_changed` | `update()`, or `remove()` if HA deleted the entity; a full `replace()` instead while the hash is dirty and HA is connected | — |
+| HA registry change | — (the index is rebuilt; live state is not written) | `register()` |
+| HA closed / unreachable / token rejected | `clear()` (the disconnect listener; `conn.stop()` does not fire it) | — |
+| A registration lands | heals a dirty hash: `replace()` if HA is connected, `clear()` if not | — |
+| Shutdown | `clear()`, then the writer's `aclose()` last | `unregister()`, between the two |
+
+Any failed live-state write marks the hash dirty (one WARNING); any `replace()` or
+`clear()` that lands marks it clean again (one INFO). One double fault never heals on its
+own: HA away *and* the disconnect's `clear()` failed — the hash keeps the last state until
+HA reconnects or the service restarts.
+
+Registrations are serialised (one attempt at a time, in the order asked for). A failed
+one retries with backoff (1 s doubling to 60 s); once one lands, nothing stays scheduled.
+
+Shutdown order (`lifespan` in `app/server.py`): cancel the env-credentials task, stop the
+state forwarder, stop the HA connection (so no listener can write live state or schedule a
+registration after the clear), cancel a pending registration retry, `clear()`,
+`unregister()`, then `aclose()`. Every step runs even if shutdown is cancelled part-way;
+the cancellation is raised after the last.
+
+The key and the entry format belong to Alfred (`alfred_sdk.live_state`). This service
+only builds entries, in `app/live_state.py`.
 
 ## Gotchas
 
