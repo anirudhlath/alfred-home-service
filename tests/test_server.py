@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from loguru import logger
 
+from app.live_state import build_snapshot
 from app.server import CredentialsBody, Registrar, apply_env_credentials, create_app
 from tests.fake_ha import FakeHAServer, eventually
 
@@ -369,7 +370,8 @@ async def test_a_failed_live_state_write_does_not_stop_forwarding(
     # Both events still forwarded, both still offered to the writer: a failed write
     # costs that entity's freshness, never the listener chain.
     await eventually(lambda: connected_app.state.forwarder.pending_count() == 2)
-    await eventually(lambda: live.update.await_count + live.replace.await_count == 1 + 2)
+    await eventually(lambda: live.update.await_count == 2)
+    assert live.replace.await_count == 1  # only the connect one: no write has landed since
     assert connected_app.state.ha.states["light.bedroom_lamp"].state == "on"
     # The live-state listener handles its own failures. HAConnection's isolation would
     # also keep the chain going, but it logs a traceback per event: it must never see one.
@@ -398,13 +400,22 @@ def _live_state_logs(records: list[Any]) -> list[str]:
     return [r["level"].name for r in records if r["name"] == "app.live_state"]
 
 
+def _record_writes(live: Any, *names: str) -> list[str]:
+    """Record the order the named writer methods are awaited in; each one lands."""
+    order: list[str] = []
+    for name in names:
+        getattr(live, name).side_effect = lambda *_, name=name: order.append(name)
+    return order
+
+
 @pytest.mark.parametrize("failed", ["update", "remove"])
 async def test_a_failed_write_heals_with_a_full_replace_then_updates_resume(
     connected_app: FastAPI, fake_ha: FakeHAServer, logs: list[Any], failed: str
 ) -> None:
     """A write lost to a Redis outage (every alfred deploy restarts Redis) leaves that
-    entity wrong until it next changes, so the next event, whatever entity it is for,
-    republishes everything; once that lands, events go back to one entity each."""
+    entity wrong until it next changes. So the next event, whatever entity it is for,
+    makes its own write and, once that lands (Redis is back), republishes everything;
+    after that, events go back to one entity each."""
     live = connected_app.state.live_state
     publisher = connected_app.state.live_state_publisher
     getattr(live, failed).side_effect = ConnectionError("redis down")
@@ -412,10 +423,12 @@ async def test_a_failed_write_heals_with_a_full_replace_then_updates_resume(
     await fake_ha.push_state_changed("light.bedroom_lamp", "on", lamp)
     await eventually(lambda: getattr(live, failed).await_count == 1)
     assert publisher.dirty
-    getattr(live, failed).side_effect = None  # Redis is back
+    order = _record_writes(live, "update", "remove", "replace")  # Redis is back
 
     await fake_ha.push_state_changed("sensor.outdoor_temp", "20", "21")
     await eventually(lambda: live.replace.await_count == 2)  # the connect one, then the heal
+    assert order == ["update", "replace"]  # the event's own write landed first
+    assert live.update.await_args.args[2].state == "21"
     healed = _states(live.replace.await_args.args[0])
     assert healed.get("light.bedroom_lamp") == lamp
     assert healed["sensor.outdoor_temp"] == "21"
@@ -450,11 +463,13 @@ async def test_a_failed_startup_clear_and_connect_replace_heal_on_the_next_event
         assert (live.clear.await_count, live.replace.await_count) == (1, 1)
         assert publisher.dirty
 
+        order = _record_writes(live, "update", "replace")
         await fake_ha.push_state_changed("light.bedroom_lamp", "on", "off")
         await eventually(lambda: live.replace.await_count == 2)
+        assert order == ["update", "replace"]  # the lamp's own write proved Redis back
+        assert live.update.await_args.args[2].state == "off"
         assert _states(live.replace.await_args.args[0])["light.bedroom_lamp"] == "off"
         assert not publisher.dirty
-        live.update.assert_not_awaited()
 
 
 async def test_a_failed_disconnect_clear_stays_dirty_until_the_reconnect_replace(
@@ -475,18 +490,31 @@ async def test_a_failed_disconnect_clear_stays_dirty_until_the_reconnect_replace
     assert _live_state_logs(logs) == ["WARNING", "INFO"]
 
 
-async def test_while_redis_stays_down_each_event_tries_one_replace_quietly(
-    connected_app: FastAPI, fake_ha: FakeHAServer, logs: list[Any]
+async def test_while_redis_stays_down_each_event_tries_only_its_own_write_quietly(
+    connected_app: FastAPI,
+    fake_ha: FakeHAServer,
+    logs: list[Any],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """While dirty, an event's own write is the probe: one that fails builds no snapshot
+    of the whole house, so an outage costs one small write per event."""
+    snapshots = 0
+
+    def counting_build_snapshot(*args: Any) -> ContextSnapshot:
+        nonlocal snapshots
+        snapshots += 1
+        return build_snapshot(*args)
+
+    monkeypatch.setattr("app.live_state.build_snapshot", counting_build_snapshot)
     live = connected_app.state.live_state
     live.update.side_effect = ConnectionError("redis down")
     live.replace.side_effect = ConnectionError("redis down")
     for i in range(3):
         await fake_ha.push_state_changed("sensor.outdoor_temp", str(20 + i), str(21 + i))
-    await eventually(lambda: live.replace.await_count == 1 + 2)
+    await eventually(lambda: live.update.await_count == 3)
 
-    assert live.update.await_count == 1  # the first event, before anything had failed
-    assert live.replace.await_count == 3  # the connect one, then one per event while dirty
+    assert live.replace.await_count == 1  # only the connect one
+    assert snapshots == 0
     assert connected_app.state.live_state_publisher.dirty
     # One warning for the outage, from the publisher; nothing per event, from anyone.
     assert len([r for r in logs if r["level"].no >= _WARNING]) == 1
