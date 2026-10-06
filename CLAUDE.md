@@ -30,20 +30,21 @@ uv run pytest -q
 Nothing here runs on a schedule; only a failed registration is retried, with backoff.
 Alfred hears from this service on events:
 
-| Moment | Live state (`LiveStatePublisher`) | Registration (`Registrar`) |
+| Moment | Live state (`LiveStatePublisher`) | Registration |
 |---|---|---|
 | Startup | `clear()` (a killed run may have left its hash) | `register()` |
 | HA connected | rebuild the entity index, then a full `replace()` from `conn.states` — published even if the rebuild fails | then generate capabilities (first connect only), then `register()` |
 | HA `state_changed` | `update()`, or `remove()` if HA deleted the entity; a full `replace()` instead while the hash is dirty and HA is connected | — |
 | HA registry change | — (the index is rebuilt; live state is not written) | `register()` |
 | HA closed / unreachable / token rejected | `clear()` (the disconnect listener; `conn.stop()` does not fire it) | — |
-| A registration lands | heals a dirty hash: `replace()` if HA is connected, `clear()` if not | — |
+| A registration lands (any of the above) | heals a dirty hash: `replace()` if HA is connected, `clear()` if not | — |
 | Shutdown | `clear()`, then the writer's `aclose()` last | `unregister()`, between the two |
 
 Any failed live-state write marks the hash dirty (one WARNING); any `replace()` or
 `clear()` that lands marks it clean again (one INFO). One double fault never heals on its
 own: HA away *and* the disconnect's `clear()` failed — the hash keeps the last state until
-HA reconnects or the service restarts.
+HA reconnects or the service restarts (or a registration retry already pending when Redis
+returns).
 
 Registrations are serialised (one attempt at a time, in the order asked for). A failed
 one retries with backoff (1 s doubling to 60 s); once one lands, nothing stays scheduled.
