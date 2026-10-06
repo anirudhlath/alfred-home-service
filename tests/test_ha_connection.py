@@ -306,22 +306,56 @@ async def test_disconnect_listener_quiet_when_switching_servers(
         await other.stop()
 
 
+# Bound on every wait in the overlapping-attempt tests, so a regression fails, not hangs.
+_BOUND = 3.0
+
+
+def _stalling(conn: HAConnection) -> tuple[asyncio.Event, asyncio.Event]:
+    """Register a disconnect listener that holds an attempt open until `release` is set.
+
+    Tests set `release` in a finally: if a regression re-enters the listener when the
+    fixture's stop() cancels the connection, it then returns at once instead of
+    blocking that stop() forever.
+    """
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def stall() -> None:
+        entered.set()
+        await release.wait()
+
+    conn.add_disconnect_listener(stall)
+    return entered, release
+
+
 async def test_a_superseded_apply_credentials_still_returns(
     fake_ha: FakeHAServer, conn: HAConnection
 ) -> None:
     """A second apply_credentials cancels the first attempt; the first caller must not hang."""
-    entered = asyncio.Event()
+    entered, release = _stalling(conn)
+    try:
+        first = asyncio.create_task(conn.apply_credentials(fake_ha.url, "wrong-token"))
+        await asyncio.wait_for(entered.wait(), _BOUND)
 
-    async def stall() -> None:
-        entered.set()
-        await asyncio.Event().wait()  # holds the rejected attempt open until cancelled
+        second = await asyncio.wait_for(conn.apply_credentials(fake_ha.url, fake_ha.token), _BOUND)
 
-    conn.add_disconnect_listener(stall)
-    first = asyncio.create_task(conn.apply_credentials(fake_ha.url, "wrong-token"))
-    await asyncio.wait_for(entered.wait(), timeout=1.0)
+        assert second == "connected"
+        # The superseded caller's attempt never finished, so it must not report success.
+        assert await asyncio.wait_for(first, _BOUND) != "connected"
+    finally:
+        release.set()
 
-    second = await asyncio.wait_for(conn.apply_credentials(fake_ha.url, fake_ha.token), 1.0)
 
-    assert second == "connected"
-    # The superseded caller's attempt never finished, so it must not report success.
-    assert await asyncio.wait_for(first, timeout=1.0) != "connected"
+async def test_stop_releases_a_pending_apply_credentials(
+    fake_ha: FakeHAServer, conn: HAConnection
+) -> None:
+    """A bare stop() (shutdown) cancels the attempt; the waiting caller must not hang."""
+    entered, release = _stalling(conn)
+    try:
+        first = asyncio.create_task(conn.apply_credentials(fake_ha.url, "wrong-token"))
+        await asyncio.wait_for(entered.wait(), _BOUND)
+
+        await asyncio.wait_for(conn.stop(), _BOUND)
+
+        assert await asyncio.wait_for(first, _BOUND) != "connected"
+    finally:
+        release.set()

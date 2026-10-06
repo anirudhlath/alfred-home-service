@@ -148,9 +148,6 @@ class HAConnection:
         self._url = normalized
         self._token = token
         self.conn_state = "disconnected"
-        # stop() cancelled any attempt still in flight, which would never set this event,
-        # so release a caller still waiting on it before replacing it.
-        self._attempt_done.set()
         self._attempt_done = asyncio.Event()
         self._task = asyncio.create_task(self._run(), name="ha-connection")
         await self._attempt_done.wait()
@@ -165,6 +162,10 @@ class HAConnection:
         self._task = None
         self._registry_refresh_task = None
         self._ws = None
+        # A cancelled attempt never sets this event, so release any apply_credentials
+        # caller still waiting on it — whether a newer apply_credentials or shutdown
+        # stopped us.
+        self._attempt_done.set()
 
     def _ws_url(self) -> str:
         if self._url.startswith("https://"):
