@@ -89,7 +89,8 @@ class CapabilityGenerator:
         """Build the static tool set (frozen for the process lifetime).
 
         New HA domains appearing later require a service restart; entity/area
-        renames stay live via build_tool_meta() + context snapshots.
+        renames stay live via build_tool_meta() + the live state Alfred reads
+        (app/live_state.py).
         """
         specs: list[GeneratedToolSpec] = []
         domains_present = index.domains()

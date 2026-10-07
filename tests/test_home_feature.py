@@ -1,4 +1,4 @@
-"""Tests for HomeCapabilitiesFeature: handler binding, dispatch, context."""
+"""Tests for HomeCapabilitiesFeature: handler binding and dispatch."""
 
 from __future__ import annotations
 
@@ -111,30 +111,6 @@ async def test_unknown_target_raises_lookup_error(
     feature, _stub, _ctx = feature_env
     with pytest.raises(LookupError, match="Areas:"):
         await feature._execute_by_name("home.light_turn_on", {"target": "attic"})
-
-
-async def test_get_context_buckets_and_filters_attributes(
-    feature_env: tuple[HomeCapabilitiesFeature, StubHA, HomeCapabilitiesContext],
-) -> None:
-    feature, stub, _ctx = feature_env
-    stub.states["weather.home"] = HAEntityState(
-        entity_id="weather.home",
-        state="sunny",
-        attributes={"friendly_name": "Home", "forecast": [{"big": "blob"}]},
-    )
-    snapshot = await feature.get_context()
-    # domains with services → controllable; without → sensors
-    assert "light" in snapshot.controllable
-    assert "lock" in snapshot.controllable
-    assert "sensor" in snapshot.sensors
-    assert "binary_sensor" in snapshot.sensors
-    assert "weather" in snapshot.sensors  # not in DEFAULT_SERVICES catalog
-    lights = {e.entity_id: e for e in snapshot.controllable["light"]}
-    assert lights["light.bedroom_lamp"].state == "on"
-    assert lights["light.bedroom_lamp"].attributes["brightness"] == 128
-    weather = snapshot.sensors["weather"][0]
-    assert "forecast" not in weather.attributes  # filtered by allowlist
-    assert weather.attributes["friendly_name"] == "Home"
 
 
 def test_to_manifest_propagates_audience_and_risk(

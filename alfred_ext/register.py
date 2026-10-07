@@ -21,7 +21,7 @@ def build_credentials_schema() -> CredentialSchema:
                 label="Home Assistant URL",
                 field_type="url",
                 required=True,
-                placeholder="http://192.168.50.159:8123",
+                placeholder="http://homeassistant.local:8123",
                 default="http://homeassistant.local:8123",
                 help_text="Base URL of the Home Assistant instance.",
             ),

@@ -12,7 +12,7 @@ Built with FastAPI + websockets + aiomqtt, packaged with
 ## How it fits into Alfred
 
 ```
-┌──────────────┐  tool manifest + context    ┌──────────────┐                    ┌────────────────┐
+┌──────────────┐  tool manifest + live state ┌──────────────┐                    ┌────────────────┐
 │    Alfred    │ ◄────── via Redis ───────── │ home-service │  WebSocket (auth,  │ Home Assistant │
 │  Home Agent  │                             │   (FastAPI)  │  events, registry, │                │
 │              │ ── POST /mcp (JSON-RPC) ──► │              │  call_service) ──► │                │
@@ -44,6 +44,13 @@ Built with FastAPI + websockets + aiomqtt, packaged with
 4. **State ingest** — every `state_changed` becomes a bus-schema
    `StateChangedEvent` published to MQTT `home/state_changed`. No HA-side
    automation is required anymore.
+5. **Live state** — what HA's entities are doing right now goes to Alfred's
+   Redis through alfred-sdk's `LiveStateWriter`: the whole house on connect,
+   one entity per state change, and a clear at startup, on disconnect and at
+   shutdown. Alfred reads it fresh for its prompts. Registration carries no
+   state and happens only at startup, on connect and when HA's registries
+   change. The full lifecycle, including how a write lost to a Redis outage
+   heals, is the table in `CLAUDE.md` ("Alfred lifecycle").
 
 ## API
 
@@ -60,7 +67,7 @@ Built with FastAPI + websockets + aiomqtt, packaged with
 | `HA_HOST` | *(unset)* | Dev fallback HA base URL (UI-pushed credentials are authoritative) |
 | `HA_TOKEN` | *(unset)* | Dev fallback long-lived access token |
 | `SERVICE_HOST` | `localhost` | Hostname Alfred uses to reach `/mcp` and `/credentials` |
-| `REDIS_URL` | `redis://localhost:6379` | Alfred's tool-registry Redis (alfred-sdk) |
+| `REDIS_URL` | `redis://localhost:6379` | Alfred's Redis (alfred-sdk): the tool registry and live state |
 | `MQTT_HOST` | `localhost` | MQTT broker for state forwarding |
 | `MQTT_PORT` | `1883` | MQTT broker port |
 

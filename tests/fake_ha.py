@@ -416,6 +416,16 @@ class FakeHAServer:
         self.subscriptions: dict[str, int] = {}
         self.auth_attempts = 0
         self.fail_service_calls = False
+        # get_states sets get_states_requested, then waits for get_states_gate when one is set
+        self.get_states_requested = asyncio.Event()
+        self.get_states_gate: asyncio.Event | None = None
+        # call_service sets call_service_requested, then waits for call_service_gate when one
+        # is set (HA leaving a command unanswered)
+        self.call_service_requested = asyncio.Event()
+        self.call_service_gate: asyncio.Event | None = None
+        # (entity_id, old_state, new_state) events sent straight behind the get_states reply,
+        # as HA does when a state changes while it answers
+        self.state_changes_after_get_states: list[tuple[str, str | None, str | None]] = []
         self.port = 0
         self._server: Server | None = None
         self._connections: set[ServerConnection] = set()
@@ -466,7 +476,12 @@ class FakeHAServer:
                 self.subscriptions[str(msg.get("event_type", "*"))] = msg_id
                 await self._send_result(ws, msg_id, None)
             case "get_states":
+                self.get_states_requested.set()
+                if self.get_states_gate is not None:
+                    await self.get_states_gate.wait()
                 await self._send_result(ws, msg_id, self.states)
+                for entity_id, old_state, new_state in self.state_changes_after_get_states:
+                    await ws.send(json.dumps(self._state_changed(entity_id, old_state, new_state)))
             case "get_services":
                 await self._send_result(ws, msg_id, self.services)
             case "config/entity_registry/list":
@@ -476,6 +491,9 @@ class FakeHAServer:
             case "config/area_registry/list":
                 await self._send_result(ws, msg_id, self.area_registry)
             case "call_service":
+                self.call_service_requested.set()
+                if self.call_service_gate is not None:
+                    await self.call_service_gate.wait()
                 if self.fail_service_calls:
                     await ws.send(
                         json.dumps(
@@ -524,6 +542,15 @@ class FakeHAServer:
         new_state: str | None,
         attributes: dict[str, Any] | None = None,
     ) -> None:
+        await self._broadcast(self._state_changed(entity_id, old_state, new_state, attributes))
+
+    def _state_changed(
+        self,
+        entity_id: str,
+        old_state: str | None,
+        new_state: str | None,
+        attributes: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         sub_id = self.subscriptions["state_changed"]
         attrs = attributes or {}
         data: dict[str, Any] = {
@@ -539,13 +566,11 @@ class FakeHAServer:
                 else None
             ),
         }
-        await self._broadcast(
-            {
-                "id": sub_id,
-                "type": "event",
-                "event": {"event_type": "state_changed", "data": data},
-            }
-        )
+        return {
+            "id": sub_id,
+            "type": "event",
+            "event": {"event_type": "state_changed", "data": data},
+        }
 
     async def push_registry_updated(self, kind: str, data: dict[str, Any]) -> None:
         """kind: 'entity' | 'device' | 'area'."""

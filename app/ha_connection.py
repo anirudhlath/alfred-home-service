@@ -10,6 +10,8 @@ Design notes:
 - Listeners are awaited inside the reader loop, so they MUST NOT issue
   WebSocket commands (would deadlock the correlation loop). Registry refresh
   therefore runs as a separate coalesced task.
+- Because listeners are awaited on the reader, a slow listener delays every
+  later frame: a hung Redis holds it for up to 5 s per live-state write.
 - `auth_invalid` is terminal: no retry until `apply_credentials` is called
   again with new credentials.
 - The `websockets` library handles ping/pong keepalive automatically.
@@ -18,7 +20,6 @@ Design notes:
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import time
 from collections.abc import Awaitable, Callable
@@ -28,10 +29,15 @@ from loguru import logger
 from pydantic import BaseModel, Field
 from websockets.asyncio.client import ClientConnection, connect
 
+from app.tasks import cancel_and_wait
+
 ConnState = Literal["connected", "auth_failed", "unreachable", "disconnected"]
 
 StateListener = Callable[[str, str | None, str | None, dict[str, Any]], Awaitable[None]]
 VoidListener = Callable[[], Awaitable[None]]
+# Runs on the reader as a command's successful result frame is handled, before the next
+# frame; an exception it raises fails the command instead.
+ResultHook = Callable[[Any], None]
 
 COMMAND_TIMEOUT = 30.0
 
@@ -77,8 +83,9 @@ class HAConnection:
         self._registry_refresh_task: asyncio.Task[None] | None = None
         self._registry_dirty = False
         self._next_msg_id = 1
-        self._pending: dict[int, asyncio.Future[Any]] = {}
+        self._pending: dict[int, tuple[asyncio.Future[Any], ResultHook | None]] = {}
         self._attempt_done = asyncio.Event()
+        self._lifecycle_lock = asyncio.Lock()
 
         self.conn_state: ConnState = "disconnected"
         self.states: dict[str, HAEntityState] = {}
@@ -91,6 +98,7 @@ class HAConnection:
         self._state_listeners: list[StateListener] = []
         self._registry_listeners: list[VoidListener] = []
         self._connect_listeners: list[VoidListener] = []
+        self._disconnect_listeners: list[VoidListener] = []
 
     # ── listeners ──
 
@@ -102,6 +110,20 @@ class HAConnection:
 
     def add_connect_listener(self, cb: VoidListener) -> None:
         self._connect_listeners.append(cb)
+
+    def add_disconnect_listener(self, cb: VoidListener) -> None:
+        """Awaited when an established connection closes, or an attempt fails or is rejected.
+
+        Not called when stop() cancels the connection.
+        """
+        self._disconnect_listeners.append(cb)
+
+    async def _notify_disconnect(self) -> None:
+        for cb in self._disconnect_listeners:
+            try:
+                await cb()
+            except Exception:
+                logger.exception("disconnect listener failed")
 
     def last_event_age_s(self) -> float | None:
         if self._last_event_monotonic is None:
@@ -120,33 +142,61 @@ class HAConnection:
         Without this guard, every re-registration with Alfred's core (the SDK's
         `register()` unconditionally emits `ServiceRegistered`, which the core
         `credential_push_worker` answers by re-pushing the stored HA creds to
-        `POST /credentials` — this happens on every `on_connect` AND every 300s
-        refresh_loop re-register) would unconditionally tear down and reconnect
-        here, which fires `on_connect` again, which re-registers, which gets
-        re-pushed again — an infinite reconnect loop on the normal production
-        path (credentials saved once via the Settings UI).
+        `POST /credentials` — this happens on every re-register, on each HA
+        connect and on each HA registry change) would unconditionally tear down
+        and reconnect here, which fires `on_connect` again, which re-registers,
+        which gets re-pushed again — an infinite reconnect loop on the normal
+        production path (credentials saved once via the Settings UI).
         """
         normalized = url.rstrip("/")
-        if normalized == self._url and token == self._token and self.conn_state == "connected":
-            return self.conn_state
-        await self.stop()
-        self._url = normalized
-        self._token = token
-        self.conn_state = "disconnected"
-        self._attempt_done = asyncio.Event()
-        self._task = asyncio.create_task(self._run(), name="ha-connection")
-        await self._attempt_done.wait()
+        # Check, stop, swap and start as one critical section. Unserialised, two calls
+        # that overlap while an old task is being cancelled both stop that task, and the
+        # later one then overwrites the earlier one's new task without stopping it.
+        async with self._lifecycle_lock:
+            if normalized == self._url and token == self._token and self.conn_state == "connected":
+                return self.conn_state
+            await self._stop_locked()
+            self._url = normalized
+            self._token = token
+            attempt_done = self._attempt_done = asyncio.Event()
+            self._task = asyncio.create_task(self._run(), name="ha-connection")
+        # Wait outside the lock, so a newer apply_credentials or stop() can cancel this attempt.
+        await attempt_done.wait()
         return self.conn_state
 
     async def stop(self) -> None:
-        for task in (self._task, self._registry_refresh_task):
-            if task is not None and not task.done():
-                task.cancel()
-                with contextlib.suppress(BaseException):
+        """Cancel the connection; any apply_credentials caller still waiting returns."""
+        async with self._lifecycle_lock:
+            await self._stop_locked()
+
+    async def _stop_locked(self) -> None:
+        # cancelling() counts every cancel ever requested of the caller, including ones it
+        # has already handled, so only a rise from here on is aimed at this stop (the idiom
+        # asyncio.timeout uses). A cancel while waiting for the lock raises from acquire().
+        caller = asyncio.current_task()
+        cancelling_at_entry = caller.cancelling() if caller is not None else 0
+        tasks = [t for t in (self._task, self._registry_refresh_task) if t and not t.done()]
+        for task in tasks:
+            task.cancel()
+        try:
+            for task in tasks:
+                try:
                     await task
-        self._task = None
-        self._registry_refresh_task = None
-        self._ws = None
+                except BaseException as exc:
+                    # The task's own cancellation (or failure) is expected and swallowed.
+                    # A cancellation aimed at whoever called stop() must reach them, as a
+                    # CancelledError even when the task unwound with something else.
+                    if caller is not None and caller.cancelling() > cancelling_at_entry:
+                        raise asyncio.CancelledError() from exc
+        finally:
+            self._task = None
+            self._registry_refresh_task = None
+            self._ws = None
+            self.conn_state = "disconnected"
+            # A cancelled attempt never sets this event, so release any apply_credentials
+            # caller still waiting on it, whether a newer apply_credentials or shutdown
+            # stopped us. The state is reset first, so that caller reads "disconnected".
+            self._attempt_done.set()
 
     def _ws_url(self) -> str:
         if self._url.startswith("https://"):
@@ -168,14 +218,23 @@ class HAConnection:
                         async for raw in ws:
                             await self._handle_message(json.loads(raw))
                     finally:
-                        setup.cancel()
                         self._ws = None
+                        # Before any await: a cancel aimed at us during the wait below
+                        # (stop() landing, or its caller cancelled) would otherwise skip
+                        # this, and a pending command would wait out COMMAND_TIMEOUT.
                         self._fail_pending()
+                        # Wait for the setup to end, so the disconnect listeners below run
+                        # after anything its connect listeners were writing, not alongside
+                        # it. A cancel aimed at us while we wait still reaches us (see
+                        # cancel_and_wait).
+                        await cancel_and_wait(setup)
                 self.conn_state = "unreachable"
                 logger.warning("HA WebSocket closed — reconnecting in {:.1f}s", backoff)
+                await self._notify_disconnect()
             except HAAuthError as exc:
                 self.conn_state = "auth_failed"
                 logger.error("HA rejected token ({}) — waiting for new credentials", exc)
+                await self._notify_disconnect()
                 self._attempt_done.set()
                 return
             except asyncio.CancelledError:
@@ -188,6 +247,7 @@ class HAConnection:
                     exc,
                     backoff,
                 )
+                await self._notify_disconnect()
             self._attempt_done.set()
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, self._max_backoff)
@@ -209,15 +269,7 @@ class HAConnection:
             for event_type in SUBSCRIBED_EVENTS:
                 await self._cmd(ws, {"type": "subscribe_events", "event_type": event_type})
             await self._refresh_registries(ws)
-            raw_states: list[dict[str, Any]] = await self._cmd(ws, {"type": "get_states"}) or []
-            self.states = {
-                s["entity_id"]: HAEntityState(
-                    entity_id=s["entity_id"],
-                    state=s.get("state", "unknown"),
-                    attributes=s.get("attributes", {}),
-                )
-                for s in raw_states
-            }
+            await self._cmd(ws, {"type": "get_states"}, on_result=self._install_states)
             self.services_catalog = await self._cmd(ws, {"type": "get_services"}) or {}
             self.conn_state = "connected"
             logger.info(
@@ -238,6 +290,23 @@ class HAConnection:
             logger.error("HA post-connect setup failed: {}", exc)
             await ws.close()  # reader loop exits → _run marks unreachable + retries
 
+    def _install_states(self, raw_states: Any) -> None:
+        """Replace the states with get_states' reply, on the reader as its frame is handled.
+
+        HA may send a state_changed straight behind the reply, and the reader handles it
+        before this setup task resumes. Installed here, the reply is in place first and the
+        event applies on top of it; installed after the await, the older reply would
+        overwrite the event, and the connect snapshot would publish the stale value.
+        """
+        self.states = {
+            s["entity_id"]: HAEntityState(
+                entity_id=s["entity_id"],
+                state=s.get("state", "unknown"),
+                attributes=s.get("attributes", {}),
+            )
+            for s in raw_states or []
+        }
+
     async def _refresh_registries(self, ws: ClientConnection) -> None:
         self.entity_registry = await self._cmd(ws, {"type": "config/entity_registry/list"}) or []
         self.device_registry = await self._cmd(ws, {"type": "config/device_registry/list"}) or []
@@ -245,11 +314,13 @@ class HAConnection:
 
     # ── command correlation ──
 
-    async def _cmd(self, ws: ClientConnection, payload: dict[str, Any]) -> Any:
+    async def _cmd(
+        self, ws: ClientConnection, payload: dict[str, Any], *, on_result: ResultHook | None = None
+    ) -> Any:
         msg_id = self._next_msg_id
         self._next_msg_id += 1
         fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
-        self._pending[msg_id] = fut
+        self._pending[msg_id] = (fut, on_result)
         try:
             await ws.send(json.dumps({"id": msg_id, **payload}))
             return await asyncio.wait_for(fut, timeout=COMMAND_TIMEOUT)
@@ -257,7 +328,7 @@ class HAConnection:
             self._pending.pop(msg_id, None)
 
     def _fail_pending(self) -> None:
-        for fut in self._pending.values():
+        for fut, _ in self._pending.values():
             if not fut.done():
                 fut.set_exception(HACommandError("connection_lost", "WebSocket closed"))
         self._pending.clear()
@@ -267,10 +338,17 @@ class HAConnection:
     async def _handle_message(self, msg: dict[str, Any]) -> None:
         match msg.get("type"):
             case "result":
-                fut = self._pending.get(int(msg["id"]))
+                fut, on_result = self._pending.get(int(msg["id"]), (None, None))
                 if fut is not None and not fut.done():
                     if msg.get("success"):
-                        fut.set_result(msg.get("result"))
+                        result = msg.get("result")
+                        try:
+                            if on_result is not None:
+                                on_result(result)
+                        except Exception as exc:
+                            fut.set_exception(exc)
+                        else:
+                            fut.set_result(result)
                     else:
                         err = msg.get("error") or {}
                         fut.set_exception(

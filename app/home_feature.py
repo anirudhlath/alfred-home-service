@@ -11,27 +11,11 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
-from alfred_sdk.context import ContextEntry, ContextSnapshot
 from alfred_sdk.feature import BaseFeature, ToolMeta
 
 from app.capability_generator import CapabilityGenerator, GeneratedToolSpec
 from app.entity_index import EntityIndex
 from app.ha_connection import HAEntityState
-
-# Attributes kept in context snapshots — everything else is dropped to keep
-# the Reflex prompt small (HA attributes can be huge, e.g. weather forecasts).
-CONTEXT_ATTR_ALLOWLIST = frozenset(
-    {
-        "friendly_name",
-        "device_class",
-        "brightness",
-        "current_temperature",
-        "temperature",
-        "media_title",
-        "battery_level",
-        "unit_of_measurement",
-    }
-)
 
 
 class HAConnectionLike(Protocol):
@@ -127,17 +111,3 @@ class HomeCapabilitiesFeature(BaseFeature):  # type: ignore[misc] # alfred-sdk h
             "service_data": service_data,
             "status": "ok",
         }
-
-    async def get_context(self) -> ContextSnapshot:
-        """Live context from the connection's state store (fed by WS events)."""
-        controllable: dict[str, list[ContextEntry]] = {}
-        sensors: dict[str, list[ContextEntry]] = {}
-        catalog_domains = set(self._conn.services_catalog)
-        for entity_id in sorted(self._conn.states):
-            st = self._conn.states[entity_id]
-            domain = entity_id.split(".", 1)[0]
-            attrs = {k: v for k, v in st.attributes.items() if k in CONTEXT_ATTR_ALLOWLIST}
-            entry = ContextEntry(entity_id=entity_id, state=st.state, attributes=attrs)
-            bucket = controllable if domain in catalog_domains else sensors
-            bucket.setdefault(domain, []).append(entry)
-        return ContextSnapshot(controllable=controllable, sensors=sensors)

@@ -9,13 +9,14 @@ automation. Forward EVERYTHING — Tier-1 visibility; SLM gating happens in core
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import os
 from typing import Any
 
 import aiomqtt
 from alfred_sdk.events import StateChangedEvent
 from loguru import logger
+
+from app.tasks import cancel_and_wait
 
 MQTT_TOPIC = "home/state_changed"
 
@@ -76,11 +77,8 @@ class StateForwarder:
             self._task = asyncio.create_task(self._publish_loop(), name="state-forwarder")
 
     async def stop(self) -> None:
-        if self._task is not None and not self._task.done():
-            self._task.cancel()
-            with contextlib.suppress(BaseException):
-                await self._task
-        self._task = None
+        task, self._task = self._task, None
+        await cancel_and_wait(task)
 
     async def _publish_loop(self) -> None:
         backoff = self._initial_backoff
