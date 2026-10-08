@@ -69,6 +69,13 @@ def test_area_via_device_and_device_name(built_index: EntityIndex) -> None:
     assert garage.device_class == "garage"  # from state attributes
 
 
+def test_areas_maps_each_entity_in_a_room_to_its_area(built_index: EntityIndex) -> None:
+    areas = built_index.areas()
+    assert areas["light.bedroom_lamp"] == "Bedroom"  # the entity's own area
+    assert areas["media_player.tv"] == "Living Room"  # its device's
+    assert "scene.movie_night" not in areas  # no area anywhere
+
+
 def test_resolve_by_area_name(built_index: EntityIndex) -> None:
     assert built_index.resolve("light", "Living Room") == ["light.living_room_lamp"]
     assert built_index.resolve("light", "living room") == ["light.living_room_lamp"]

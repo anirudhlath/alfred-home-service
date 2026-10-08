@@ -7,6 +7,8 @@ all tool execution resolves areas / friendly names → real entity IDs here.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any
 
 from pydantic import BaseModel
@@ -31,6 +33,7 @@ class EntityIndex:
     def __init__(self) -> None:
         self._entities: dict[str, EntityInfo] = {}
         self._area_names: list[str] = []
+        self._areas: Mapping[str, str] = MappingProxyType({})
 
     def rebuild(
         self,
@@ -69,9 +72,20 @@ class EntityIndex:
             )
         self._entities = entities
         self._area_names = sorted(areas.values())
+        self._areas = MappingProxyType(
+            {e.entity_id: e.area for e in entities.values() if e.area is not None}
+        )
 
     def get(self, entity_id: str) -> EntityInfo | None:
         return self._entities.get(entity_id)
+
+    def areas(self) -> Mapping[str, str]:
+        """entity_id → area name, for every entity in one (its own area, else its device's).
+
+        Read-only, and replaced rather than changed by rebuild(), so a reference taken
+        before a rebuild still shows the rooms as they were.
+        """
+        return self._areas
 
     def entity_count(self) -> int:
         return len(self._entities)

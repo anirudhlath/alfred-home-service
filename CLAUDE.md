@@ -34,8 +34,8 @@ are retried, with backoff. Alfred hears from this service on events:
 |---|---|---|
 | Startup | `clear()` (a killed run may have left its hash) | `register()` |
 | HA connected | rebuild the entity index, then a full `replace()` from `conn.states` — published even if the rebuild fails | then generate capabilities (first connect only), then `register()` |
-| HA `state_changed` | `update()`, or `remove()` if HA deleted the entity; while the hash is dirty and HA is connected, a full `replace()` follows once that write lands | — |
-| HA registry change | — (the index is rebuilt; live state is not written) | `register()` |
+| HA `state_changed` | `update()`, or `remove()` if HA deleted the entity; while the hash is dirty or stale and HA is connected, a full `replace()` follows once that write lands | — |
+| HA registry change | — (the index is rebuilt; live state is not written). If any entity's room changed, the hash is marked stale, so the next state event republishes it | `register()` |
 | HA closed, each failed reconnect attempt, token rejected | `clear()` (the disconnect listener, run once the connect setup has ended; `conn.stop()` does not fire it) | — |
 | A registration lands (any of the above) | heals a dirty hash: `replace()` if HA is connected, `clear()` if not | — |
 | Shutdown | `clear()`, then the writer's `aclose()` last | `unregister()`, between the two |
@@ -60,7 +60,10 @@ registration after the clear), cancel a pending registration retry, `clear()`,
 the cancellation is raised after the last.
 
 The key and the entry format belong to Alfred (`alfred_sdk.live_state`). This service
-only builds entries, in `app/live_state.py`.
+only builds entries, in `app/live_state.py`. HA keeps rooms in its registries, not on
+state objects, so an entry's `area` attribute comes from `EntityIndex.areas()` (the
+entity's own area, else its device's). An entity newer than the last index rebuild has
+no area until the registry update that adds it, which marks the hash stale.
 
 ## Gotchas
 

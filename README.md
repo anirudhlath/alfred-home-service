@@ -47,7 +47,9 @@ Built with FastAPI + websockets + aiomqtt, packaged with
 5. **Live state** — what HA's entities are doing right now goes to Alfred's
    Redis through alfred-sdk's `LiveStateWriter`: the whole house on connect,
    one entity per state change, and a clear at startup, on disconnect and at
-   shutdown. Alfred reads it fresh for its prompts. Registration carries no
+   shutdown. Each entity in a room carries it as the `area` attribute (its own area,
+   else its device's), so Alfred can group the house by room. Alfred reads it fresh
+   for its prompts. Registration carries no
    state and happens only at startup, on connect and when HA's registries
    change. The full lifecycle, including how a write lost to a Redis outage
    heals, is the table in `CLAUDE.md` ("Alfred lifecycle").
