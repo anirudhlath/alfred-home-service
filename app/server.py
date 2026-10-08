@@ -190,7 +190,7 @@ def create_app() -> FastAPI:
     forwarder = StateForwarder()
     client = build_client()
     live_state = LiveStateWriter(client.redis_url, client.service_name)
-    publisher = LiveStatePublisher(live_state, conn)
+    publisher = LiveStatePublisher(live_state, conn, index)
     # A registration that lands proves Redis reachable: heal any write it lost meanwhile.
     registrar = Registrar(client, on_registered=publisher.heal)
     generator = CapabilityGenerator(
@@ -279,8 +279,12 @@ def create_app() -> FastAPI:
     async def on_registries_updated() -> None:
         # Never writes live state: this runs in HAConnection's registry-refresh task, which
         # a disconnect does not cancel, so a write here could land after the disconnect's
-        # clear and bring back state for a connection that is gone.
+        # clear and bring back state for a connection that is gone. A room move therefore
+        # only marks the publisher stale; the next state event republishes.
+        areas = index.areas()
         await rebuild_index()
+        if index.areas() != areas:
+            publisher.mark_stale()
         await registrar.register()
 
     conn.add_connect_listener(on_connect)

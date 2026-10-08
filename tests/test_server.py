@@ -335,7 +335,7 @@ async def test_a_state_change_updates_one_entity(
         ContextEntry(
             entity_id="light.bedroom_lamp",
             state="off",
-            attributes={"friendly_name": "Bedroom Lamp"},
+            attributes={"friendly_name": "Bedroom Lamp", "area": "Bedroom"},
         ),
     )
 
@@ -817,6 +817,76 @@ async def test_a_registry_change_never_writes_live_state(
     await eventually(lambda: connected_app.state.client.register.await_count == registered + 1)
 
     assert {name: getattr(live, name).await_count for name in writes} == before
+
+
+def _areas(snapshot: ContextSnapshot) -> dict[str, Any]:
+    return {
+        entry.entity_id: entry.attributes.get("area")
+        for groups in (snapshot.controllable, snapshot.sensors)
+        for entries in groups.values()
+        for entry in entries
+    }
+
+
+async def test_connect_publishes_each_entity_with_its_room(connected_app: FastAPI) -> None:
+    areas = _areas(connected_app.state.live_state.replace.await_args.args[0])
+    assert areas["light.bedroom_lamp"] == "Bedroom"
+    assert areas["media_player.tv"] == "Living Room"  # from its device
+    assert areas["scene.movie_night"] is None
+
+
+def _move(fake_ha: FakeHAServer, registry: str, key: str, value: str, area_id: str) -> None:
+    rows = fake_ha.entity_registry if registry == "entity" else fake_ha.device_registry
+    row = next(r for r in rows if r[key] == value)
+    row["area_id"] = area_id
+
+
+@pytest.mark.parametrize(
+    ("registry", "key", "value", "entity_id"),
+    [
+        ("entity", "entity_id", "light.bedroom_lamp", "light.bedroom_lamp"),
+        ("device", "id", "dev-tv", "media_player.tv"),
+    ],
+)
+async def test_a_room_move_republishes_on_the_next_state_event(
+    connected_app: FastAPI,
+    fake_ha: FakeHAServer,
+    registry: str,
+    key: str,
+    value: str,
+    entity_id: str,
+) -> None:
+    """The registry refresh never writes live state (see the test below), so a move only
+    marks the hash stale; the next state event's write lands and the full replace follows,
+    carrying the new room. No restart is needed."""
+    live = connected_app.state.live_state
+    registered = connected_app.state.client.register.await_count
+    _move(fake_ha, registry, key, value, "garage")
+
+    await fake_ha.push_registry_updated(registry, {"action": "update", key: value})
+    await eventually(lambda: connected_app.state.client.register.await_count == registered + 1)
+    assert live.replace.await_count == 1  # only the connect's: the refresh wrote nothing
+
+    await fake_ha.push_state_changed("switch.coffee_maker", "off", "on")
+    await eventually(lambda: live.replace.await_count == 2)
+    assert _areas(live.replace.await_args.args[0])[entity_id] == "Garage"
+
+    await fake_ha.push_state_changed("switch.coffee_maker", "on", "off")
+    await eventually(lambda: live.update.await_count == 2)
+    assert live.replace.await_count == 2  # healed once; updates resume
+
+
+async def test_a_registry_change_that_moves_no_room_marks_nothing_stale(
+    connected_app: FastAPI, fake_ha: FakeHAServer
+) -> None:
+    live = connected_app.state.live_state
+    registered = connected_app.state.client.register.await_count
+    await fake_ha.push_registry_updated("entity", {"action": "update", "entity_id": "x.y"})
+    await eventually(lambda: connected_app.state.client.register.await_count == registered + 1)
+
+    await fake_ha.push_state_changed("switch.coffee_maker", "off", "on")
+    await eventually(lambda: live.update.await_count == 1)
+    assert live.replace.await_count == 1
 
 
 def _record(calls: list[str], *targets: tuple[Any, str]) -> None:

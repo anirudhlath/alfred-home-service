@@ -3,6 +3,9 @@
 build_entry maps an HA entity state to the (domain, kind, ContextEntry) Alfred's
 LiveStateWriter takes. replace()'s snapshot and every update() both go through
 it, so the two can never classify an entity differently.
+
+HA keeps rooms in its registries, not on state objects, so the entry's ``area``
+attribute comes from EntityIndex: the entity's own area, else its device's.
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ from alfred_sdk.context import ContextEntry, ContextSnapshot
 from alfred_sdk.live_state import LiveStateWriter
 from loguru import logger
 
+from app.entity_index import EntityIndex
 from app.ha_connection import HAConnection, HAEntityState
 
 # Mirrors alfred_sdk.live_state.LiveStateKind, which mypy cannot see (alfred-sdk has no
@@ -37,12 +41,18 @@ CONTEXT_ATTR_ALLOWLIST = frozenset(
 
 
 def build_entry(
-    state: HAEntityState, catalog_domains: Container[str]
+    state: HAEntityState, catalog_domains: Container[str], areas: Mapping[str, str]
 ) -> tuple[str, Kind, ContextEntry]:
-    """(domain, kind, entry): a domain HA offers services for is controllable."""
+    """(domain, kind, entry): a domain HA offers services for is controllable.
+
+    ``areas`` maps entity IDs to room names; an entity in none carries no ``area``.
+    """
     domain = state.entity_id.split(".", 1)[0]
     kind: Kind = "controllable" if domain in catalog_domains else "sensor"
     attributes = {k: v for k, v in state.attributes.items() if k in CONTEXT_ATTR_ALLOWLIST}
+    area = areas.get(state.entity_id)
+    if area is not None:
+        attributes["area"] = area
     return (
         domain,
         kind,
@@ -51,13 +61,13 @@ def build_entry(
 
 
 def build_snapshot(
-    states: Mapping[str, HAEntityState], catalog_domains: Container[str]
+    states: Mapping[str, HAEntityState], catalog_domains: Container[str], areas: Mapping[str, str]
 ) -> ContextSnapshot:
     """Every entity, grouped as Alfred's ContextSnapshot, in entity-ID order."""
     controllable: dict[str, list[ContextEntry]] = {}
     sensors: dict[str, list[ContextEntry]] = {}
     for entity_id in sorted(states):
-        domain, kind, entry = build_entry(states[entity_id], catalog_domains)
+        domain, kind, entry = build_entry(states[entity_id], catalog_domains, areas)
         bucket = controllable if kind == "controllable" else sensors
         bucket.setdefault(domain, []).append(entry)
     return ContextSnapshot(controllable=controllable, sensors=sensors)
@@ -83,23 +93,39 @@ class LiveStatePublisher:
     may still be the previous connection's, while state events already flow and the
     registration path is never cancelled. The disconnect's clear is requested only after
     that flag drops, so a replace handed over while it was up lands before the clear.
+
+    Rooms come from the EntityIndex. When they move, mark_stale() asks for the same full
+    replace, run by the next state event whose own write lands, as a heal is: the registry
+    refresh that notices the move must never write live state itself.
     """
 
-    def __init__(self, writer: LiveStateWriter, conn: HAConnection) -> None:
+    def __init__(self, writer: LiveStateWriter, conn: HAConnection, index: EntityIndex) -> None:
         self._writer = writer
         self._conn = conn
+        self._index = index
         self._dirty = False
+        self._stale = False
 
     @property
     def dirty(self) -> bool:
         """A write failed and no replace or clear has landed since."""
         return self._dirty
 
+    def mark_stale(self) -> None:
+        """Rooms moved in HA: the next state event republishes the whole hash. Writes nothing."""
+        if not self._stale:
+            self._stale = True
+            logger.info("Rooms changed in HA — live state republishes on the next state change")
+
     async def publish(self) -> None:
         """Replace the whole hash with HA's current states (on connect, and to heal)."""
         # Built and handed over with no await between, so the writer's FIFO lock orders
-        # it after every update requested before it.
-        snapshot = build_snapshot(self._conn.states, self._conn.services_catalog)
+        # it after every update requested before it. The rooms it reads are the newest, so
+        # it settles a pending mark_stale() here; one that arrives during the write stands.
+        snapshot = build_snapshot(
+            self._conn.states, self._conn.services_catalog, self._index.areas()
+        )
+        self._stale = False
         try:
             await self._writer.replace(snapshot)
         except Exception as exc:
@@ -134,12 +160,14 @@ class LiveStatePublisher:
             if state is None:  # HA deleted the entity
                 await self._writer.remove(entity_id)
             else:
-                domain, kind, entry = build_entry(state, self._conn.services_catalog)
+                domain, kind, entry = build_entry(
+                    state, self._conn.services_catalog, self._index.areas()
+                )
                 await self._writer.update(domain, kind, entry)
         except Exception as exc:
             self._failed(f"write of {entity_id}", exc)
             return
-        if self._dirty and self._conn.conn_state == "connected":
+        if (self._dirty or self._stale) and self._conn.conn_state == "connected":
             await self.publish()
 
     async def clear(self) -> None:
