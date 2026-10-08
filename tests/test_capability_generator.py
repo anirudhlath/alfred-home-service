@@ -261,3 +261,48 @@ def test_untargeted_service_has_no_target_param(generator: CapabilityGenerator) 
     meta = generator.build_tool_meta(by_name["home.vacuum_start"], index)
     assert "target" not in meta.parameters
     assert by_name["home.vacuum_start"].risk == "elevated"  # vacuum is elevated in risk map
+
+
+def _vacuum_index() -> EntityIndex:
+    index = EntityIndex()
+    index.rebuild(
+        entity_registry=[],
+        device_registry=[],
+        area_registry=[],
+        states={
+            "vacuum.robo": HAEntityState(entity_id="vacuum.robo", state="docked", attributes={})
+        },
+    )
+    return index
+
+
+def test_required_fields_and_target_are_required(generator: CapabilityGenerator) -> None:
+    catalog: dict[str, Any] = {
+        "vacuum": {
+            "send_command": {
+                "name": "Send command",
+                "description": "Send a command.",
+                "fields": {
+                    "command": {"description": "Command to send.", "required": True},
+                    "params": {"description": "Extra parameters.", "selector": {"object": {}}},
+                },
+                "target": {"entity": {"domain": "vacuum"}},
+            }
+        }
+    }
+    index = _vacuum_index()
+    spec = {s.tool_name: s for s in generator.generate(catalog, index)}["home.vacuum_send_command"]
+    meta = generator.build_tool_meta(spec, index)
+    assert meta.input_schema["required"] == ["target", "command"]
+    assert meta.parameters["command"].required is True
+    assert meta.parameters["params"].required is False
+    assert "(required)" not in meta.parameters["command"].description
+
+
+def test_call_service_requires_domain_and_service(
+    generator: CapabilityGenerator,
+    specs: list[GeneratedToolSpec],
+    built_index: EntityIndex,
+) -> None:
+    meta = generator.build_tool_meta(_by_name(specs)["home.call_service"], built_index)
+    assert meta.input_schema["required"] == ["domain", "service"]

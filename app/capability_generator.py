@@ -34,6 +34,7 @@ class FieldSpec:
     name: str
     type: str
     description: str
+    required: bool = False
 
 
 @dataclass(frozen=True)
@@ -68,9 +69,12 @@ def _field_spec(name: str, fdef: dict[str, Any] | None) -> FieldSpec:
     example = fdef.get("example")
     if example is not None:
         description += f" Example: {example}."
-    if fdef.get("required"):
-        description += " (required)"
-    return FieldSpec(name=name, type=_field_type(fdef), description=description)
+    return FieldSpec(
+        name=name,
+        type=_field_type(fdef),
+        description=description,
+        required=bool(fdef.get("required")),
+    )
 
 
 def _service_description(svc: dict[str, Any], domain: str, service: str) -> str:
@@ -199,8 +203,12 @@ class CapabilityGenerator:
         parameters: dict[str, ToolParameter] = {}
         if spec.domain is None:
             parameters = {
-                "domain": ToolParameter(type="str", description="HA service domain, e.g. 'light'."),
-                "service": ToolParameter(type="str", description="Service name, e.g. 'turn_on'."),
+                "domain": ToolParameter(
+                    type="str", description="HA service domain, e.g. 'light'.", required=True
+                ),
+                "service": ToolParameter(
+                    type="str", description="Service name, e.g. 'turn_on'.", required=True
+                ),
                 "entity_id": ToolParameter(
                     type="str",
                     description="Optional entity_id to target, e.g. 'light.living_room_lamp'.",
@@ -210,10 +218,14 @@ class CapabilityGenerator:
         else:
             if spec.targeted:
                 parameters["target"] = ToolParameter(
-                    type="str", description=self._target_description(spec.domain, index)
+                    type="str",
+                    description=self._target_description(spec.domain, index),
+                    required=True,
                 )
             for f in spec.fields:
-                parameters[f.name] = ToolParameter(type=f.type, description=f.description)
+                parameters[f.name] = ToolParameter(
+                    type=f.type, description=f.description, required=f.required
+                )
         return ToolMeta(
             name=spec.tool_name,
             description=spec.description,
