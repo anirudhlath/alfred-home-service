@@ -236,6 +236,17 @@ DEFAULT_SERVICES: dict[str, Any] = {
                     "description": "Color name.",
                     "selector": {"text": None},
                 },
+                # A UI section, as HA serves it: its fields are service-call fields too.
+                "advanced_fields": {
+                    "collapsed": True,
+                    "fields": {
+                        "flash": {
+                            "name": "Flash",
+                            "description": "Tell the light to flash.",
+                            "selector": {"select": {"options": ["long", "short"]}},
+                        },
+                    },
+                },
             },
             "target": _TARGET,
         },

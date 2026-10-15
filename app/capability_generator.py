@@ -78,6 +78,31 @@ def _service_description(svc: dict[str, Any], domain: str, service: str) -> str:
     return raw.split("\n")[0]
 
 
+def _is_section(entry: Any) -> bool:
+    # HA's catalog schema allows neither key on a field, and a section has no selector.
+    return isinstance(entry, dict) and ("fields" in entry or "collapsed" in entry)
+
+
+def _service_fields(svc: dict[str, Any]) -> dict[str, Any]:
+    """A service's fields by name, with HA's UI sections flattened away.
+
+    HA groups some fields into collapsible sections ({"collapsed": ..., "fields":
+    {...}}). Those exist only for its UI: a service call takes its data flat, so a
+    section's fields sit beside the top-level ones and the section is no field itself.
+    A top-level field keeps its name over a nested one; a section with no fields dict
+    has no fields. When two sections hold a field of the same name, the first section in
+    catalog order wins.
+    """
+    entries: dict[str, Any] = svc.get("fields") or {}
+    fields = {name: fdef for name, fdef in entries.items() if not _is_section(fdef)}
+    for entry in entries.values():
+        nested = entry.get("fields") if _is_section(entry) else None
+        if isinstance(nested, dict):
+            for name, fdef in nested.items():
+                fields.setdefault(name, fdef)
+    return fields
+
+
 class CapabilityGenerator:
     """HA service catalog × EntityIndex → tagged tool specs and manifests."""
 
@@ -126,7 +151,7 @@ class CapabilityGenerator:
             svc = services.get(service)
             if svc is None:
                 continue  # this HA doesn't offer the service
-            catalog_fields: dict[str, Any] = svc.get("fields") or {}
+            catalog_fields = _service_fields(svc)
             fields = tuple(
                 _field_spec(f, catalog_fields.get(f)) for f in extra_fields if f in catalog_fields
             )
@@ -152,7 +177,7 @@ class CapabilityGenerator:
         specs: list[GeneratedToolSpec] = []
         for service in sorted(services):
             svc: dict[str, Any] = services[service] or {}
-            catalog_fields: dict[str, Any] = svc.get("fields") or {}
+            catalog_fields = _service_fields(svc)
             fields = tuple(_field_spec(name, fdef) for name, fdef in sorted(catalog_fields.items()))
             specs.append(
                 GeneratedToolSpec(
