@@ -25,10 +25,11 @@ dev = [
     "types-PyYAML>=6.0",
 ]
 
-# alfred-sdk is not on PyPI. Pinned to alfred's merge commit that ships
-# alfred_sdk.live_state (alfred#281). Switch to an alfred release tag once one carries it.
+# alfred-sdk is not on PyPI. Pinned to an alfred master commit that ships input_schema,
+# ToolParameter.required and dispatch validation (alfred#300/#301/#324). Switch to an
+# alfred release tag once one carries it.
 [tool.uv.sources]
-alfred-sdk = { git = "https://github.com/anirudhlath/alfred.git", rev = "3be19e60cf2cd93af6b14b6bf60008c0686d4373", subdirectory = "sdk" }
+alfred-sdk = { git = "https://github.com/anirudhlath/alfred.git", rev = "8e5e6e4bd8ad33f02ab9e44cd2ce11159775918c", subdirectory = "sdk" }
 
 [tool.setuptools.packages.find]
 include = ["app*", "alfred_ext*"]
