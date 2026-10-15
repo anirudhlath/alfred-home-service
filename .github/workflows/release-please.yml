@@ -15,13 +15,13 @@ jobs:
     steps:
       # Bot App token, not GITHUB_TOKEN: tags/Releases created with GITHUB_TOKEN can
       # never trigger downstream workflows (deploy hooks etc.).
-      - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         if: env.HAS_BOT_APP == 'true'
         id: app
         with:
           app-id: ${{ secrets.BOT_APP_ID }}
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
-      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         if: env.HAS_BOT_APP == 'true'
         with:
           token: ${{ steps.app.outputs.token }}
