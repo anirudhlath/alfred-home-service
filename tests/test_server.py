@@ -131,6 +131,7 @@ async def test_mcp_dispatches_generated_tool_end_to_end(
     assert data["id"] == "req-001"
     assert data["error"] is None
     assert data["result"]["entity_ids"] == ["light.living_room_lamp"]
+    assert data["result"]["context_id"] == "ctx-1"
     assert fake_ha.service_calls == [
         {
             "domain": "light",

@@ -282,15 +282,17 @@ class HAConnection:
             raise HACommandError("protocol", f"expected auth_ok, got {resp.get('type')}")
 
     async def _on_connected(self, ws: ClientConnection) -> None:
-        """Post-auth setup: subscribe, refresh registries/states/catalog, notify."""
-        # Forget the previous connection's user before any event can arrive: the token may
-        # have changed, and a failed lookup below must leave "unknown", not a stale user.
+        """Post-auth: learn the HA user, subscribe, refresh registries/states/catalog, notify."""
+        # Forget the previous connection's user: the token may have changed, and a failed
+        # lookup below must leave "unknown", not a stale user. The lookup comes before the
+        # subscriptions because events are only delivered once subscribed, so no change can
+        # arrive before the user is known.
         self.user_id = None
         self.is_owner = False
         try:
+            await self._learn_own_user(ws)
             for event_type in SUBSCRIBED_EVENTS:
                 await self._cmd(ws, {"type": "subscribe_events", "event_type": event_type})
-            await self._learn_own_user(ws)
             await self._refresh_registries(ws)
             await self._cmd(ws, {"type": "get_states"}, on_result=self._install_states)
             self.services_catalog = await self._cmd(ws, {"type": "get_services"}) or {}
@@ -316,8 +318,9 @@ class HAConnection:
     async def _learn_own_user(self, ws: ClientConnection) -> None:
         """Ask HA who this token belongs to, so changes made through it can be told apart.
 
-        Best effort: a failed lookup logs a warning and leaves the user unknown, which only
-        means no change is ever marked as the service's own.
+        Best effort, and fail closed: a failed lookup, or a reply that is not a dict, has no
+        string `id` or has an `is_owner` that is not a bool, logs one warning and leaves the
+        user unknown, which only means no change is ever marked as the service's own.
         """
         try:
             result = await self._cmd(ws, {"type": "auth/current_user"})
@@ -329,15 +332,23 @@ class HAConnection:
                 exc,
             )
             return
-        user_id = result.get("id") if isinstance(result, dict) else None
-        if not isinstance(user_id, str):
+        reply = result if isinstance(result, dict) else {}
+        user_id, is_owner = reply.get("id"), reply.get("is_owner")
+        if not isinstance(user_id, str) or not isinstance(is_owner, bool):
             logger.warning(
-                "HA did not name this connection's user — its own changes will not be recognised"
+                "HA's reply did not identify this connection's HA user — "
+                "its own changes will not be recognised"
             )
             return
         self.user_id = user_id
-        self.is_owner = result.get("is_owner") is True
-        if self.is_owner:
+        self.is_owner = is_owner
+        name = reply.get("name")
+        logger.info(
+            "home-service is HA user {!r} ({})",
+            name if isinstance(name, str) else None,
+            "owner" if is_owner else "admin" if reply.get("is_admin") is True else "non-admin",
+        )
+        if is_owner:
             logger.warning(
                 "home-service is using the Home Assistant owner's token, so its changes "
                 "cannot be told from the owner's own; it needs an HA user of its own"
@@ -436,9 +447,15 @@ class HAConnection:
             )
         self._last_event_monotonic = time.monotonic()
         # HA sets the context on the event and on the new state; the event's is preferred.
-        # One that is not a dict counts as absent, so it falls through to the other.
+        # One that is not a dict, or has no string id, counts as absent, so it falls through
+        # to the other.
         raw_context = next(
-            (c for c in (event_context, (new or {}).get("context")) if isinstance(c, dict)), None
+            (
+                c
+                for c in (event_context, (new or {}).get("context"))
+                if isinstance(c, dict) and isinstance(c.get("id"), str)
+            ),
+            None,
         )
         context = self._build_context(raw_context)
         for cb in self._state_listeners:
@@ -450,7 +467,8 @@ class HAConnection:
     def _build_context(self, raw: dict[str, Any] | None) -> HAContext | None:
         """The listeners' view of an HA context; None when the event carried none.
 
-        An id that is not a string reads as None.
+        A user_id or parent_id that is not a string reads as None. The caller only passes a
+        dict with a string id; anything else is absent and never gets here.
         """
         if raw is None:
             return None
