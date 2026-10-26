@@ -43,7 +43,12 @@ Built with FastAPI + websockets + aiomqtt, packaged with
    hatch. Risk tiers come from `config/risk_map.yaml` (data, not code).
 4. **State ingest** — every `state_changed` becomes a bus-schema
    `StateChangedEvent` published to MQTT `home/state_changed`. No HA-side
-   automation is required anymore.
+   automation is required anymore. Each event carries a `context` saying who
+   caused the change: HA's context ids (`id`, `user_id`, `parent_id`), the
+   `person` entity whose HA user made it (when there is one), and `by_service`
+   when the change came from this service's own HA user. A tool call returns
+   the HA context id of its service call as `context_id` (null when HA gave
+   none), so Alfred can recognise the resulting change as its own.
 5. **Live state** — what HA's entities are doing right now goes to Alfred's
    Redis through alfred-sdk's `LiveStateWriter`: the whole house on connect,
    one entity per state change, and a clear at startup, on disconnect and at

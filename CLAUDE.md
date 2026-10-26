@@ -50,6 +50,14 @@ token HA rejected while Redis was down. There are no further attempts then, so t
 keeps the last known state until new credentials connect, the service restarts, or a
 registration retry that was already pending lands.
 
+State events carry who caused the change. `StateForwarder.build_event` turns the
+`HAContext` that `HAConnection` passes every listener into the event's `context`
+(`ChangeContext`: `id`, `user_id`, `parent_id`, `person`, and `by_service` from
+`HAContext.by_self`); with no context the field stays `None`. `HomeCapabilitiesFeature._execute`
+returns the service call's HA context id as `context_id` beside its existing keys (`None`
+unless HA's result carries a string `context.id`), which is how Alfred matches its own
+actions to the changes they cause.
+
 Registrations are serialised (one attempt at a time, in the order asked for). A failed
 one retries with backoff (1 s doubling to 60 s); once one lands, nothing stays scheduled.
 

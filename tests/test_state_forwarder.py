@@ -8,6 +8,7 @@ import aiomqtt
 import pytest
 from alfred_sdk.events import StateChangedEvent
 
+from app.ha_connection import HAContext
 from app.state_forwarder import MQTT_TOPIC, StateForwarder
 from tests.fake_ha import eventually
 
@@ -40,6 +41,48 @@ def test_build_event_new_entity_has_null_old_state() -> None:
     event = StateForwarder.build_event("light.new", None, "off", {})
     assert event is not None
     assert event.old_state is None
+
+
+def test_build_event_carries_the_context() -> None:
+    context = HAContext(
+        id="c1", user_id="u1", parent_id="p1", person="person.resident", by_self=False
+    )
+    event = StateForwarder.build_event("light.a", "on", "off", {}, context)
+    assert event is not None
+    assert event.context is not None
+    assert event.context.id == "c1"
+    assert event.context.user_id == "u1"
+    assert event.context.parent_id == "p1"
+    assert event.context.person == "person.resident"
+    assert event.context.by_service is False
+
+    own = HAContext(id="c2", user_id="u2", parent_id=None, person=None, by_self=True)
+    event = StateForwarder.build_event("light.a", "on", "off", {}, own)
+    assert event is not None
+    assert event.context is not None
+    assert event.context.by_service is True
+    assert event.context.person is None
+    assert event.context.parent_id is None
+
+    assert StateForwarder.build_event("light.a", "on", "off", {}) is not None
+    event = StateForwarder.build_event("light.a", "on", "off", {}, None)
+    assert event is not None
+    assert event.context is None
+
+
+async def test_on_state_changed_publishes_the_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeMqttClient()
+    monkeypatch.setattr("app.state_forwarder.aiomqtt.Client", lambda host, port: fake)
+    forwarder = StateForwarder(host="broker", port=1883)
+    context = HAContext(id="c1", user_id="u1", parent_id=None, person=None, by_self=True)
+    await forwarder.on_state_changed("light.a", "on", "off", {}, context)
+    await forwarder.start()
+    await eventually(lambda: len(fake.published) == 1)
+    event = StateChangedEvent.model_validate_json(fake.published[0][1])
+    assert event.context is not None
+    assert event.context.id == "c1"
+    assert event.context.by_service is True
+    await forwarder.stop()
 
 
 async def test_queue_full_drops_with_warning() -> None:
