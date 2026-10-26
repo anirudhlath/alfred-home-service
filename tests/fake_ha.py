@@ -582,11 +582,21 @@ class FakeHAServer:
         attributes: dict[str, Any] | None = None,
         context: Any = None,
         context_at: Literal["event", "new_state", "both"] = "both",
+        new_state_context: Any = None,
     ) -> None:
-        """Push a state_changed; a context is sent where HA puts it (event and new state)."""
+        """Push a state_changed; a context is sent where HA puts it (event and new state).
+
+        new_state_context, when given, replaces the context sent inside new_state.
+        """
         await self._broadcast(
             self._state_changed(
-                entity_id, old_state, new_state, attributes, context=context, context_at=context_at
+                entity_id,
+                old_state,
+                new_state,
+                attributes,
+                context=context,
+                context_at=context_at,
+                new_state_context=new_state_context,
             )
         )
 
@@ -599,6 +609,7 @@ class FakeHAServer:
         *,
         context: Any = None,
         context_at: Literal["event", "new_state", "both"] = "both",
+        new_state_context: Any = None,
     ) -> dict[str, Any]:
         sub_id = self.subscriptions["state_changed"]
         attrs = attributes or {}
@@ -616,11 +627,15 @@ class FakeHAServer:
             ),
         }
         event: dict[str, Any] = {"event_type": "state_changed", "data": data}
-        if context is not None:
-            if context_at in ("event", "both"):
-                event["context"] = context
-            if context_at in ("new_state", "both") and data["new_state"] is not None:
-                data["new_state"]["context"] = context
+        if context is not None and context_at in ("event", "both"):
+            event["context"] = context
+        state_context = (
+            new_state_context
+            if new_state_context is not None
+            else (context if context_at in ("new_state", "both") else None)
+        )
+        if state_context is not None and data["new_state"] is not None:
+            data["new_state"]["context"] = state_context
         return {"id": sub_id, "type": "event", "event": event}
 
     async def push_registry_updated(self, kind: str, data: dict[str, Any]) -> None:

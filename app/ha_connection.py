@@ -436,7 +436,10 @@ class HAConnection:
             )
         self._last_event_monotonic = time.monotonic()
         # HA sets the context on the event and on the new state; the event's is preferred.
-        raw_context = event_context if event_context is not None else (new or {}).get("context")
+        # One that is not a dict counts as absent, so it falls through to the other.
+        raw_context = next(
+            (c for c in (event_context, (new or {}).get("context")) if isinstance(c, dict)), None
+        )
         context = self._build_context(raw_context)
         for cb in self._state_listeners:
             try:
@@ -444,14 +447,16 @@ class HAConnection:
             except Exception:
                 logger.exception("state listener failed for {}", entity_id)
 
-    def _build_context(self, raw: Any) -> HAContext | None:
-        """The listeners' view of an HA context; None when the event carried none."""
+    def _build_context(self, raw: dict[str, Any] | None) -> HAContext | None:
+        """The listeners' view of an HA context; None when the event carried none.
+
+        An id that is not a string reads as None.
+        """
         if raw is None:
             return None
-        fields = raw if isinstance(raw, dict) else {}
         ctx_id, user_id, parent_id = (
             v if isinstance(v, str) else None
-            for v in (fields.get("id"), fields.get("user_id"), fields.get("parent_id"))
+            for v in (raw.get("id"), raw.get("user_id"), raw.get("parent_id"))
         )
         return HAContext(
             id=ctx_id,
