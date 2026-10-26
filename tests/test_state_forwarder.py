@@ -44,8 +44,8 @@ def test_build_event_new_entity_has_null_old_state() -> None:
 
 async def test_queue_full_drops_with_warning() -> None:
     forwarder = StateForwarder(host="mqtt-unused", port=1883, queue_size=1)
-    await forwarder.on_state_changed("light.a", "on", "off", {})
-    await forwarder.on_state_changed("light.b", "on", "off", {})  # dropped
+    await forwarder.on_state_changed("light.a", "on", "off", {}, None)
+    await forwarder.on_state_changed("light.b", "on", "off", {}, None)  # dropped
     assert forwarder.pending_count() == 1
 
 
@@ -81,7 +81,7 @@ async def test_publish_loop_publishes_event_json(monkeypatch: pytest.MonkeyPatch
     fake = _FakeMqttClient()
     monkeypatch.setattr("app.state_forwarder.aiomqtt.Client", lambda host, port: fake)
     forwarder = StateForwarder(host="broker", port=1883)
-    await forwarder.on_state_changed("light.a", "on", "off", {"friendly_name": "A"})
+    await forwarder.on_state_changed("light.a", "on", "off", {"friendly_name": "A"}, None)
     await forwarder.start()
     await eventually(lambda: len(fake.published) == 1)
     topic, payload = fake.published[0]
@@ -101,7 +101,7 @@ async def test_publish_loop_retries_after_mqtt_error(
     forwarder = StateForwarder(host="broker", port=1883)
     # shrink backoff for the test
     forwarder._initial_backoff = 0.02
-    await forwarder.on_state_changed("light.a", "on", "off", {})
+    await forwarder.on_state_changed("light.a", "on", "off", {}, None)
     await forwarder.start()
     await eventually(lambda: len(fake.published) == 1)
     assert factory.attempts == 2
@@ -125,7 +125,7 @@ async def test_stop_passes_on_a_cancellation_aimed_at_its_caller(
 
     monkeypatch.setattr("app.state_forwarder.aiomqtt.Client", lambda host, port: _SlowToCancel())
     forwarder = StateForwarder(host="broker", port=1883)
-    await forwarder.on_state_changed("light.a", "on", "off", {})
+    await forwarder.on_state_changed("light.a", "on", "off", {}, None)
     await forwarder.start()
     try:
         await asyncio.wait_for(entered.wait(), 3.0)

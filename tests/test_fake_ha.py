@@ -85,3 +85,20 @@ async def test_call_service_recorded_and_error_mode(fake_ha: FakeHAServer) -> No
         err = json.loads(await ws.recv())
         assert err["success"] is False
         assert err["error"]["code"] == "service_validation_error"
+
+
+async def test_current_user_answers_with_the_configured_user_or_an_error(
+    fake_ha: FakeHAServer,
+) -> None:
+    async with connect(_ws_url(fake_ha)) as ws:
+        await ws.recv()
+        await ws.send(json.dumps({"type": "auth", "access_token": "test-token"}))
+        await ws.recv()
+        await ws.send(json.dumps({"id": 1, "type": "auth/current_user"}))
+        ok = json.loads(await ws.recv())
+        assert ok["success"] is True
+        assert ok["result"]["id"] == "svc"
+        assert ok["result"]["is_owner"] is False
+        fake_ha.fail_current_user = True
+        await ws.send(json.dumps({"id": 2, "type": "auth/current_user"}))
+        assert json.loads(await ws.recv())["success"] is False

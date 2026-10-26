@@ -16,6 +16,7 @@ import aiomqtt
 from alfred_sdk.events import StateChangedEvent
 from loguru import logger
 
+from app.ha_connection import HAContext
 from app.tasks import cancel_and_wait
 
 MQTT_TOPIC = "home/state_changed"
@@ -59,6 +60,7 @@ class StateForwarder:
         old_state: str | None,
         new_state: str | None,
         attributes: dict[str, Any],
+        context: HAContext | None,
     ) -> None:
         """HAConnection state listener — forward everything, no source filtering."""
         event = self.build_event(entity_id, old_state, new_state, attributes)
