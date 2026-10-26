@@ -26,10 +26,11 @@ dev = [
 ]
 
 # alfred-sdk is not on PyPI. Pinned to an alfred master commit that ships input_schema,
-# ToolParameter.required and dispatch validation (alfred#300/#301/#324). Switch to an
-# alfred release tag once one carries it.
+# ToolParameter.required, dispatch validation (alfred#300/#301/#324) and the
+# StateChangedEvent change context (alfred#317). Switch to an alfred release tag once one
+# carries it.
 [tool.uv.sources]
-alfred-sdk = { git = "https://github.com/anirudhlath/alfred.git", rev = "8e5e6e4bd8ad33f02ab9e44cd2ce11159775918c", subdirectory = "sdk" }
+alfred-sdk = { git = "https://github.com/anirudhlath/alfred.git", rev = "dbeae95f722d6d5c884f860ba3923775fbab6f9e", subdirectory = "sdk" }
 
 [tool.setuptools.packages.find]
 include = ["app*", "alfred_ext*"]
