@@ -29,7 +29,11 @@ Built with FastAPI + websockets + aiomqtt, packaged with
    Saving pushes `POST /credentials {url, token}`; the service connects live
    and returns its resulting health. `.env` `HA_HOST`/`HA_TOKEN` remain a dev
    fallback. Credentials are held in memory only — on restart, Alfred's core
-   re-pushes them (ServiceRegistered event).
+   re-pushes them (ServiceRegistered event). The token should belong to an HA
+   user of its own, not the owner: a non-admin user is enough unless HA refuses
+   one of the commands. On each connect the service asks HA which user the
+   token belongs to (`auth/current_user`); with the owner's token it logs a
+   warning and never sets `by_service`, so its changes read as the owner's.
 2. **Discovery** — on connect, the service subscribes to `state_changed` and
    registry-updated events and fetches the entity/device/area registries plus
    the service catalog. The `EntityIndex` resolves areas and friendly names to
@@ -43,7 +47,13 @@ Built with FastAPI + websockets + aiomqtt, packaged with
    hatch. Risk tiers come from `config/risk_map.yaml` (data, not code).
 4. **State ingest** — every `state_changed` becomes a bus-schema
    `StateChangedEvent` published to MQTT `home/state_changed`. No HA-side
-   automation is required anymore.
+   automation is required anymore. Each event carries a `context` saying who
+   caused the change: HA's context ids (`id`, `user_id`, `parent_id`), the
+   `person` entity whose HA user made it (when there is one), and `by_service`
+   when the change came from this service's own HA user (never set when the
+   token is the owner's). A tool call returns
+   the HA context id of its service call as `context_id` (null when HA gave
+   none), so Alfred can recognise the resulting change as its own.
 5. **Live state** — what HA's entities are doing right now goes to Alfred's
    Redis through alfred-sdk's `LiveStateWriter`: the whole house on connect,
    one entity per state change, and a clear at startup, on disconnect and at

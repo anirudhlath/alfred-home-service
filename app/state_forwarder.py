@@ -13,9 +13,10 @@ import os
 from typing import Any
 
 import aiomqtt
-from alfred_sdk.events import StateChangedEvent
+from alfred_sdk.events import ChangeContext, StateChangedEvent
 from loguru import logger
 
+from app.ha_connection import HAContext
 from app.tasks import cancel_and_wait
 
 MQTT_TOPIC = "home/state_changed"
@@ -40,10 +41,25 @@ class StateForwarder:
         old_state: str | None,
         new_state: str | None,
         attributes: dict[str, Any],
+        context: HAContext | None = None,
     ) -> StateChangedEvent | None:
-        """Map an HA state_changed to the bus schema. None → skip (entity removed)."""
+        """Map an HA state_changed to the bus schema. None → skip (entity removed).
+
+        `context` says who caused the change; without one the event carries none.
+        """
         if new_state is None:
             return None
+        change_context = (
+            ChangeContext(
+                id=context.id,
+                user_id=context.user_id,
+                parent_id=context.parent_id,
+                person=context.person,
+                by_service=context.by_self,
+            )
+            if context is not None
+            else None
+        )
         return StateChangedEvent(
             domain="home",
             source="home-service",
@@ -51,6 +67,7 @@ class StateForwarder:
             old_state=old_state,
             new_state=new_state,
             attributes=attributes,
+            context=change_context,
         )
 
     async def on_state_changed(
@@ -59,9 +76,10 @@ class StateForwarder:
         old_state: str | None,
         new_state: str | None,
         attributes: dict[str, Any],
+        context: HAContext | None,
     ) -> None:
         """HAConnection state listener — forward everything, no source filtering."""
-        event = self.build_event(entity_id, old_state, new_state, attributes)
+        event = self.build_event(entity_id, old_state, new_state, attributes, context)
         if event is None:
             return
         try:

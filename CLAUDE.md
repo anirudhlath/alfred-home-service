@@ -65,6 +65,25 @@ state objects, so an entry's `area` attribute comes from `EntityIndex.areas()` (
 entity's own area, else its device's). An entity newer than the last index rebuild has
 no area until the registry update that adds it, which marks the hash stale.
 
+## Who caused a change
+
+State events carry who caused the change. `StateForwarder.build_event` turns the
+`HAContext` that `HAConnection` passes every listener into the event's `context`
+(`ChangeContext`: `id`, `user_id`, `parent_id`, `person`, and `by_service` from
+`HAContext.by_self`); with no context the field stays `None`. A context counts only if it
+is a dict with a string `id` (the event's wins over the new state's); otherwise it is
+absent. `HomeCapabilitiesFeature._execute` returns the service call's HA context id as
+`context_id` beside its existing keys (`None` unless HA's result carries a string
+`context.id`), which is how Alfred matches its own actions to the changes they cause.
+
+`by_self` needs the HA user the token belongs to. On each connect, before it subscribes,
+`HAConnection._learn_own_user` asks HA (`auth/current_user`) and logs the user it found. A
+failed or odd reply (not a dict, no string `id`, or an `is_owner` that is not a bool)
+leaves the user unknown, with one warning, so `by_self` is never true. The token must
+belong to an HA user of its own, not the owner (non-admin is enough unless a command is
+refused): with the owner's token the service logs a warning on connect and never sets
+`by_self`, so its changes read as the owner's.
+
 ## Gotchas
 
 - `alfred-sdk` is NOT on PyPI. It is a base dependency (`alfred-sdk>=0.1.0` in

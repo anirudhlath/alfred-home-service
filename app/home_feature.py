@@ -18,6 +18,17 @@ from app.entity_index import EntityIndex
 from app.ha_connection import HAEntityState
 
 
+def _context_id(result: object) -> str | None:
+    """The HA context id of a service call's result, or None when it carries no string id."""
+    if not isinstance(result, dict):
+        return None
+    context = result.get("context")
+    if not isinstance(context, dict):
+        return None
+    context_id = context.get("id")
+    return context_id if isinstance(context_id, str) else None
+
+
 class HAConnectionLike(Protocol):
     """Structural slice of HAConnection used by generated capabilities."""
 
@@ -90,10 +101,16 @@ class HomeCapabilitiesFeature(BaseFeature):  # type: ignore[misc] # alfred-sdk h
             service = str(params["service"])
             data = dict(params.get("data") or {})
             entity_id = params.get("entity_id")
-            await self._conn.call_service(
+            result = await self._conn.call_service(
                 domain, service, data, [str(entity_id)] if entity_id else None
             )
-            return {"domain": domain, "service": service, "entity_id": entity_id, "status": "ok"}
+            return {
+                "domain": domain,
+                "service": service,
+                "entity_id": entity_id,
+                "status": "ok",
+                "context_id": _context_id(result),
+            }
         entity_ids: list[str] | None = None
         if spec.targeted:
             target = params.get("target")
@@ -103,11 +120,12 @@ class HomeCapabilitiesFeature(BaseFeature):  # type: ignore[misc] # alfred-sdk h
         service_data = {
             f.name: params[f.name] for f in spec.fields if params.get(f.name) is not None
         }
-        await self._conn.call_service(spec.domain, spec.service, service_data, entity_ids)
+        result = await self._conn.call_service(spec.domain, spec.service, service_data, entity_ids)
         return {
             "domain": spec.domain,
             "service": spec.service,
             "entity_ids": entity_ids,
             "service_data": service_data,
             "status": "ok",
+            "context_id": _context_id(result),
         }

@@ -13,7 +13,7 @@ import asyncio
 import json
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 from websockets.asyncio.server import Server, ServerConnection, serve
 
@@ -217,6 +217,17 @@ DEFAULT_STATES: list[dict[str, Any]] = [
     },
 ]
 
+# What HA answers to auth/current_user for the token the fake accepts: a non-owner user.
+DEFAULT_CURRENT_USER: dict[str, Any] = {
+    "id": "svc",
+    "name": "svc",
+    "is_owner": False,
+    "is_admin": True,
+    "is_active": True,
+    "credentials": [],
+    "mfa_modules": [],
+}
+
 _TARGET = {"entity": [{}]}
 
 DEFAULT_SERVICES: dict[str, Any] = {
@@ -410,8 +421,10 @@ class FakeHAServer:
         entity_registry: list[dict[str, Any]] | None = None,
         device_registry: list[dict[str, Any]] | None = None,
         area_registry: list[dict[str, Any]] | None = None,
+        current_user: dict[str, Any] | None = None,
     ) -> None:
         self.token = token
+        self.current_user = dict(current_user if current_user is not None else DEFAULT_CURRENT_USER)
         self.states = list(states if states is not None else DEFAULT_STATES)
         self.services = dict(services if services is not None else DEFAULT_SERVICES)
         self.entity_registry = list(
@@ -427,6 +440,7 @@ class FakeHAServer:
         self.subscriptions: dict[str, int] = {}
         self.auth_attempts = 0
         self.fail_service_calls = False
+        self.fail_current_user = False
         # get_states sets get_states_requested, then waits for get_states_gate when one is set
         self.get_states_requested = asyncio.Event()
         self.get_states_gate: asyncio.Event | None = None
@@ -486,6 +500,20 @@ class FakeHAServer:
             case "subscribe_events":
                 self.subscriptions[str(msg.get("event_type", "*"))] = msg_id
                 await self._send_result(ws, msg_id, None)
+            case "auth/current_user":
+                if self.fail_current_user:
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "id": msg_id,
+                                "type": "result",
+                                "success": False,
+                                "error": {"code": "unauthorized", "message": "boom"},
+                            }
+                        )
+                    )
+                    return
+                await self._send_result(ws, msg_id, self.current_user)
             case "get_states":
                 self.get_states_requested.set()
                 if self.get_states_gate is not None:
@@ -552,8 +580,25 @@ class FakeHAServer:
         old_state: str | None,
         new_state: str | None,
         attributes: dict[str, Any] | None = None,
+        context: Any = None,
+        context_at: Literal["event", "new_state", "both"] = "both",
+        new_state_context: Any = None,
     ) -> None:
-        await self._broadcast(self._state_changed(entity_id, old_state, new_state, attributes))
+        """Push a state_changed; a context is sent where HA puts it (event and new state).
+
+        new_state_context, when given, replaces the context sent inside new_state.
+        """
+        await self._broadcast(
+            self._state_changed(
+                entity_id,
+                old_state,
+                new_state,
+                attributes,
+                context=context,
+                context_at=context_at,
+                new_state_context=new_state_context,
+            )
+        )
 
     def _state_changed(
         self,
@@ -561,6 +606,10 @@ class FakeHAServer:
         old_state: str | None,
         new_state: str | None,
         attributes: dict[str, Any] | None = None,
+        *,
+        context: Any = None,
+        context_at: Literal["event", "new_state", "both"] = "both",
+        new_state_context: Any = None,
     ) -> dict[str, Any]:
         sub_id = self.subscriptions["state_changed"]
         attrs = attributes or {}
@@ -577,11 +626,17 @@ class FakeHAServer:
                 else None
             ),
         }
-        return {
-            "id": sub_id,
-            "type": "event",
-            "event": {"event_type": "state_changed", "data": data},
-        }
+        event: dict[str, Any] = {"event_type": "state_changed", "data": data}
+        if context is not None and context_at in ("event", "both"):
+            event["context"] = context
+        state_context = (
+            new_state_context
+            if new_state_context is not None
+            else (context if context_at in ("new_state", "both") else None)
+        )
+        if state_context is not None and data["new_state"] is not None:
+            data["new_state"]["context"] = state_context
+        return {"id": sub_id, "type": "event", "event": event}
 
     async def push_registry_updated(self, kind: str, data: dict[str, Any]) -> None:
         """kind: 'entity' | 'device' | 'area'."""

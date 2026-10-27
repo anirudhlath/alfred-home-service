@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Any
 
 import pytest
+from loguru import logger
 
-from app.ha_connection import HACommandError, HAConnection, VoidListener
+from app.ha_connection import HACommandError, HAConnection, HAContext, VoidListener
 from tests.fake_ha import FakeHAServer, eventually
 
 
@@ -95,7 +96,11 @@ async def test_state_changed_updates_states_and_notifies(
     received: list[tuple[str, str | None, str | None, dict[str, Any]]] = []
 
     async def listener(
-        entity_id: str, old: str | None, new: str | None, attrs: dict[str, Any]
+        entity_id: str,
+        old: str | None,
+        new: str | None,
+        attrs: dict[str, Any],
+        context: HAContext | None,
     ) -> None:
         received.append((entity_id, old, new, attrs))
 
@@ -107,6 +112,378 @@ async def test_state_changed_updates_states_and_notifies(
     await eventually(lambda: conn.states["light.bedroom_lamp"].state == "off")
     assert received == [("light.bedroom_lamp", "on", "off", {"friendly_name": "Bedroom Lamp"})]
     assert conn.last_event_age_s() is not None
+
+
+@pytest.fixture
+def log_warnings() -> Iterator[list[str]]:
+    """The WARNING-or-worse loguru messages emitted while the test runs."""
+    messages: list[str] = []
+    handler = logger.add(lambda m: messages.append(m.record["message"]), level="WARNING")
+    yield messages
+    logger.remove(handler)
+
+
+@pytest.fixture
+def log_infos() -> Iterator[list[str]]:
+    """The INFO-or-worse loguru messages emitted while the test runs."""
+    messages: list[str] = []
+    handler = logger.add(lambda m: messages.append(m.record["message"]), level="INFO")
+    yield messages
+    logger.remove(handler)
+
+
+def _recording_listener(conn: HAConnection) -> list[tuple[str, HAContext | None]]:
+    received: list[tuple[str, HAContext | None]] = []
+
+    async def listener(
+        entity_id: str,
+        old: str | None,
+        new: str | None,
+        attrs: dict[str, Any],
+        context: HAContext | None,
+    ) -> None:
+        received.append((entity_id, context))
+
+    conn.add_state_listener(listener)
+    return received
+
+
+def _add_person(fake_ha: FakeHAServer, entity_id: str, user_id: str | None) -> None:
+    fake_ha.states.append(
+        {"entity_id": entity_id, "state": "home", "attributes": {"user_id": user_id}}
+    )
+
+
+async def test_context_reaches_listeners_with_person_and_self(
+    fake_ha: FakeHAServer, conn: HAConnection
+) -> None:
+    fake_ha.current_user = {"id": "svc", "name": "svc", "is_owner": False, "is_admin": True}
+    _add_person(fake_ha, "person.alex", "u-alex")
+    received = _recording_listener(conn)
+    await conn.apply_credentials(fake_ha.url, fake_ha.token)
+    assert (conn.user_id, conn.is_owner) == ("svc", False)
+
+    await fake_ha.push_state_changed(
+        "light.bedroom_lamp",
+        "on",
+        "off",
+        context={"id": "c-1", "user_id": "u-alex", "parent_id": "c-0"},
+    )
+    await fake_ha.push_state_changed(
+        "light.bedroom_lamp",
+        "off",
+        "on",
+        context={"id": "c-2", "user_id": "svc", "parent_id": None},
+    )
+    await eventually(lambda: len(received) == 2)
+
+    assert received == [
+        (
+            "light.bedroom_lamp",
+            HAContext(
+                id="c-1", user_id="u-alex", parent_id="c-0", person="person.alex", by_self=False
+            ),
+        ),
+        (
+            "light.bedroom_lamp",
+            HAContext(id="c-2", user_id="svc", parent_id=None, person=None, by_self=True),
+        ),
+    ]
+
+
+async def test_owner_token_never_marks_changes_as_self(
+    fake_ha: FakeHAServer, conn: HAConnection, log_warnings: list[str]
+) -> None:
+    fake_ha.current_user = {"id": "boss", "name": "boss", "is_owner": True, "is_admin": True}
+    received = _recording_listener(conn)
+    await conn.apply_credentials(fake_ha.url, fake_ha.token)
+    assert (conn.user_id, conn.is_owner) == ("boss", True)
+    owner_warnings = [w for w in log_warnings if "owner" in w]
+    assert len(owner_warnings) == 1
+    assert "HA user of its own" in owner_warnings[0]
+
+    for new in ("off", "on"):  # the warning is per connect, not per event
+        await fake_ha.push_state_changed(
+            "light.bedroom_lamp",
+            "on",
+            new,
+            context={"id": "c-1", "user_id": "boss", "parent_id": None},
+        )
+    await eventually(lambda: len(received) == 2)
+
+    assert [ctx.by_self for _, ctx in received if ctx is not None] == [False, False]
+    assert [w for w in log_warnings if "owner" in w] == owner_warnings
+
+
+async def test_current_user_failure_is_tolerated(
+    fake_ha: FakeHAServer, conn: HAConnection, log_warnings: list[str]
+) -> None:
+    fake_ha.fail_current_user = True
+    received = _recording_listener(conn)
+    assert await conn.apply_credentials(fake_ha.url, fake_ha.token) == "connected"
+    assert conn.user_id is None
+    assert len([w for w in log_warnings if "HA user" in w]) == 1
+
+    await fake_ha.push_state_changed(
+        "light.bedroom_lamp", "on", "off", context={"id": "c-1", "user_id": "svc"}
+    )
+    await eventually(lambda: len(received) == 1)
+
+    context = received[0][1]
+    assert context is not None
+    assert (context.user_id, context.by_self) == ("svc", False)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        pytest.param({"name": "svc", "is_owner": False}, id="no-id"),
+        pytest.param({"id": 7, "name": "svc", "is_owner": False}, id="id-not-a-string"),
+        pytest.param({"id": "svc", "name": "svc"}, id="no-is_owner"),
+        pytest.param({"id": "svc", "name": "svc", "is_owner": "false"}, id="is_owner-not-a-bool"),
+    ],
+)
+async def test_an_odd_current_user_reply_is_treated_as_a_failed_lookup(
+    fake_ha: FakeHAServer, conn: HAConnection, log_warnings: list[str], reply: dict[str, Any]
+) -> None:
+    fake_ha.current_user = reply
+    received = _recording_listener(conn)
+    assert await conn.apply_credentials(fake_ha.url, fake_ha.token) == "connected"
+    assert (conn.user_id, conn.is_owner) == (None, False)
+    assert len([w for w in log_warnings if "HA user" in w]) == 1
+    assert [w for w in log_warnings if "owner" in w] == []
+
+    # A change carrying the id the odd reply named (or the default user's) is still not ours.
+    await fake_ha.push_state_changed(
+        "light.bedroom_lamp", "on", "off", context={"id": "c-1", "user_id": "svc"}
+    )
+    await eventually(lambda: len(received) == 1)
+
+    context = received[0][1]
+    assert context is not None
+    assert (context.user_id, context.by_self) == ("svc", False)
+
+
+async def test_a_reply_that_is_not_a_dict_is_treated_as_a_failed_lookup(
+    fake_ha: FakeHAServer, conn: HAConnection, log_warnings: list[str]
+) -> None:
+    fake_ha.current_user = ["svc"]  # type: ignore[assignment]
+    assert await conn.apply_credentials(fake_ha.url, fake_ha.token) == "connected"
+    assert (conn.user_id, conn.is_owner) == (None, False)
+    assert len([w for w in log_warnings if "HA user" in w]) == 1
+
+
+async def test_learning_the_own_user_logs_who_it_is_once(
+    fake_ha: FakeHAServer, conn: HAConnection, log_infos: list[str]
+) -> None:
+    fake_ha.current_user = {"id": "svc", "name": "Bridge", "is_owner": False, "is_admin": True}
+    await conn.apply_credentials(fake_ha.url, fake_ha.token)
+
+    assert [m for m in log_infos if "HA user" in m] == ["home-service is HA user 'Bridge' (admin)"]
+
+
+@pytest.mark.parametrize(
+    ("user", "role"),
+    [
+        ({"id": "u", "name": "Boss", "is_owner": True, "is_admin": True}, "owner"),
+        ({"id": "u", "name": "Plain", "is_owner": False, "is_admin": False}, "non-admin"),
+    ],
+)
+async def test_the_own_user_log_line_names_the_role(
+    fake_ha: FakeHAServer,
+    conn: HAConnection,
+    log_infos: list[str],
+    user: dict[str, Any],
+    role: str,
+) -> None:
+    fake_ha.current_user = user
+    await conn.apply_credentials(fake_ha.url, fake_ha.token)
+
+    assert [m for m in log_infos if "HA user" in m and "home-service is" in m][0].endswith(
+        f"({role})"
+    )
+
+
+async def test_the_own_user_is_learned_before_subscribing(
+    fake_ha: FakeHAServer, conn: HAConnection
+) -> None:
+    sent: list[str] = []
+    real_cmd = conn._cmd
+
+    async def recording_cmd(ws: Any, payload: dict[str, Any], **kwargs: Any) -> Any:
+        sent.append(str(payload["type"]))
+        return await real_cmd(ws, payload, **kwargs)
+
+    conn._cmd = recording_cmd  # type: ignore[method-assign]
+    await conn.apply_credentials(fake_ha.url, fake_ha.token)
+
+    assert sent[0] == "auth/current_user"
+    assert sent.index("auth/current_user") < sent.index("subscribe_events")
+    assert sent.index("subscribe_events") < sent.index("get_states")
+
+
+async def test_own_user_is_forgotten_when_a_reconnect_cannot_learn_it(
+    fake_ha: FakeHAServer, conn: HAConnection
+) -> None:
+    await conn.apply_credentials(fake_ha.url, fake_ha.token)
+    assert conn.user_id == "svc"
+
+    fake_ha.fail_current_user = True
+    await fake_ha.drop_connections()
+    await eventually(lambda: fake_ha.auth_attempts == 2, timeout=3.0)
+    await eventually(lambda: conn.conn_state == "connected", timeout=3.0)
+
+    assert conn.user_id is None
+    assert conn.is_owner is False
+
+
+async def test_user_without_person_entity_has_no_person(
+    fake_ha: FakeHAServer, conn: HAConnection
+) -> None:
+    _add_person(fake_ha, "person.alex", "u-alex")
+    _add_person(fake_ha, "person.guest", None)  # a person with no login
+    received = _recording_listener(conn)
+    await conn.apply_credentials(fake_ha.url, fake_ha.token)
+
+    for user_id in ("u-nobody", None):
+        await fake_ha.push_state_changed(
+            "light.bedroom_lamp", "on", "off", context={"id": "c-1", "user_id": user_id}
+        )
+    await eventually(lambda: len(received) == 2)
+
+    assert [ctx.person for _, ctx in received if ctx is not None] == [None, None]
+
+
+async def test_event_without_context_passes_none(fake_ha: FakeHAServer, conn: HAConnection) -> None:
+    received = _recording_listener(conn)
+    await conn.apply_credentials(fake_ha.url, fake_ha.token)
+
+    await fake_ha.push_state_changed("light.bedroom_lamp", "on", "off")
+    await eventually(lambda: len(received) == 1)
+
+    assert received == [("light.bedroom_lamp", None)]
+
+
+async def test_context_falls_back_to_the_new_state_context(
+    fake_ha: FakeHAServer, conn: HAConnection
+) -> None:
+    received = _recording_listener(conn)
+    await conn.apply_credentials(fake_ha.url, fake_ha.token)
+
+    await fake_ha.push_state_changed(
+        "light.bedroom_lamp",
+        "on",
+        "off",
+        context={"id": "c-1", "user_id": "svc", "parent_id": None},
+        context_at="new_state",
+    )
+    await eventually(lambda: len(received) == 1)
+
+    assert received[0][1] == HAContext(
+        id="c-1", user_id="svc", parent_id=None, person=None, by_self=True
+    )
+
+
+async def test_a_non_dict_event_context_falls_through_to_the_new_state_context(
+    fake_ha: FakeHAServer, conn: HAConnection
+) -> None:
+    received = _recording_listener(conn)
+    await conn.apply_credentials(fake_ha.url, fake_ha.token)
+
+    await fake_ha.push_state_changed(
+        "light.bedroom_lamp",
+        "on",
+        "off",
+        context="not-a-dict",
+        context_at="event",
+        new_state_context={"id": "c-1", "user_id": "svc", "parent_id": None},
+    )
+    await eventually(lambda: len(received) == 1)
+
+    assert received[0][1] == HAContext(
+        id="c-1", user_id="svc", parent_id=None, person=None, by_self=True
+    )
+
+
+async def test_the_event_context_wins_over_the_new_state_context(
+    fake_ha: FakeHAServer, conn: HAConnection
+) -> None:
+    received = _recording_listener(conn)
+    await conn.apply_credentials(fake_ha.url, fake_ha.token)
+
+    await fake_ha.push_state_changed(
+        "light.bedroom_lamp",
+        "on",
+        "off",
+        context={"id": "c-event", "user_id": "svc", "parent_id": None},
+        new_state_context={"id": "c-state", "user_id": "u-other", "parent_id": "c-0"},
+    )
+    await eventually(lambda: len(received) == 1)
+
+    assert received[0][1] == HAContext(
+        id="c-event", user_id="svc", parent_id=None, person=None, by_self=True
+    )
+
+
+@pytest.mark.parametrize(
+    "garbage",
+    [
+        "not-a-dict",
+        ["c-1"],
+        {"user_id": "svc", "parent_id": "c-0"},  # a dict with no id
+        {"id": 7, "user_id": "svc", "parent_id": "c-0"},  # an id that is not a string
+    ],
+)
+async def test_a_context_without_a_string_id_is_absent(
+    fake_ha: FakeHAServer, conn: HAConnection, garbage: Any
+) -> None:
+    received = _recording_listener(conn)
+    await conn.apply_credentials(fake_ha.url, fake_ha.token)
+
+    await fake_ha.push_state_changed("light.bedroom_lamp", "on", "off", context=garbage)
+    await eventually(lambda: len(received) == 1)
+
+    assert received == [("light.bedroom_lamp", None)]
+
+
+async def test_an_event_context_without_a_string_id_falls_through_to_the_new_state_context(
+    fake_ha: FakeHAServer, conn: HAConnection
+) -> None:
+    received = _recording_listener(conn)
+    await conn.apply_credentials(fake_ha.url, fake_ha.token)
+
+    await fake_ha.push_state_changed(
+        "light.bedroom_lamp",
+        "on",
+        "off",
+        context={"user_id": "u-other"},
+        context_at="event",
+        new_state_context={"id": "c-1", "user_id": "svc", "parent_id": None},
+    )
+    await eventually(lambda: len(received) == 1)
+
+    assert received[0][1] == HAContext(
+        id="c-1", user_id="svc", parent_id=None, person=None, by_self=True
+    )
+
+
+async def test_a_context_with_a_string_id_reads_odd_user_and_parent_ids_as_none(
+    fake_ha: FakeHAServer, conn: HAConnection
+) -> None:
+    received = _recording_listener(conn)
+    await conn.apply_credentials(fake_ha.url, fake_ha.token)
+
+    await fake_ha.push_state_changed(
+        "light.bedroom_lamp",
+        "on",
+        "off",
+        context={"id": "c-1", "user_id": ["svc"], "parent_id": {"x": 1}},
+    )
+    await eventually(lambda: len(received) == 1)
+
+    assert received[0][1] == HAContext(
+        id="c-1", user_id=None, parent_id=None, person=None, by_self=False
+    )
 
 
 async def test_entity_removal_drops_state(fake_ha: FakeHAServer, conn: HAConnection) -> None:

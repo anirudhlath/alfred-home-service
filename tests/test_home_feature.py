@@ -25,6 +25,7 @@ class StubHA:
         self.states = states
         self.services_catalog = services_catalog
         self.calls: list[tuple[str, str, dict[str, Any] | None, list[str] | None]] = []
+        self.result: Any = {"context": {"id": "stub"}}
 
     async def call_service(
         self,
@@ -34,7 +35,7 @@ class StubHA:
         entity_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         self.calls.append((domain, service, service_data, entity_ids))
-        return {"context": {"id": "stub"}}
+        return self.result  # type: ignore[no-any-return]
 
 
 @pytest.fixture
@@ -95,6 +96,38 @@ async def test_call_service_escape_hatch(
     )
     assert result["status"] == "ok"
     assert stub.calls == [("lock", "unlock", {}, ["lock.front_door"])]
+
+
+@pytest.mark.parametrize(
+    ("ha_result", "expected"),
+    [
+        ({"context": {"id": "c9"}, "response": None}, "c9"),
+        ({}, None),
+        ({"context": {}}, None),
+        ({"context": {"id": 7}}, None),
+        ({"context": "c9"}, None),
+        (["context"], None),
+        (None, None),
+    ],
+)
+async def test_execute_returns_the_call_context_id(
+    feature_env: tuple[HomeCapabilitiesFeature, StubHA, HomeCapabilitiesContext],
+    ha_result: Any,
+    expected: str | None,
+) -> None:
+    feature, stub, _ctx = feature_env
+    stub.result = ha_result
+    generated = await feature._execute_by_name("home.light_turn_on", {"target": "Living Room"})
+    assert generated["context_id"] == expected
+    assert generated["status"] == "ok"
+    assert generated["entity_ids"] == ["light.living_room_lamp"]
+    hatch = await feature._execute_by_name(
+        "home.call_service",
+        {"domain": "lock", "service": "unlock", "entity_id": "lock.front_door"},
+    )
+    assert hatch["context_id"] == expected
+    assert hatch["status"] == "ok"
+    assert hatch["entity_id"] == "lock.front_door"
 
 
 async def test_missing_target_raises(

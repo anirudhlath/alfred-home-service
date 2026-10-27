@@ -23,6 +23,7 @@ import asyncio
 import json
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from loguru import logger
@@ -33,7 +34,21 @@ from app.tasks import cancel_and_wait
 
 ConnState = Literal["connected", "auth_failed", "unreachable", "disconnected"]
 
-StateListener = Callable[[str, str | None, str | None, dict[str, Any]], Awaitable[None]]
+
+@dataclass(frozen=True)
+class HAContext:
+    """Who caused a state change: the HA context behind it, and who that user is."""
+
+    id: str | None
+    user_id: str | None
+    parent_id: str | None
+    person: str | None  # entity id of the person whose attributes.user_id == user_id
+    by_self: bool  # user_id is this connection's own HA user, and that user is not the owner
+
+
+StateListener = Callable[
+    [str, str | None, str | None, dict[str, Any], HAContext | None], Awaitable[None]
+]
 VoidListener = Callable[[], Awaitable[None]]
 # Runs on the reader as a command's successful result frame is handled, before the next
 # frame; an exception it raises fails the command instead.
@@ -88,6 +103,9 @@ class HAConnection:
         self._lifecycle_lock = asyncio.Lock()
 
         self.conn_state: ConnState = "disconnected"
+        # The HA user this connection's token belongs to, learned on each connect.
+        self.user_id: str | None = None
+        self.is_owner = False
         self.states: dict[str, HAEntityState] = {}
         self.services_catalog: dict[str, Any] = {}
         self.entity_registry: list[dict[str, Any]] = []
@@ -264,8 +282,15 @@ class HAConnection:
             raise HACommandError("protocol", f"expected auth_ok, got {resp.get('type')}")
 
     async def _on_connected(self, ws: ClientConnection) -> None:
-        """Post-auth setup: subscribe, refresh registries/states/catalog, notify."""
+        """Post-auth: learn the HA user, subscribe, refresh registries/states/catalog, notify."""
+        # Forget the previous connection's user: the token may have changed, and a failed
+        # lookup below must leave "unknown", not a stale user. The lookup comes before the
+        # subscriptions because events are only delivered once subscribed, so no change can
+        # arrive before the user is known.
+        self.user_id = None
+        self.is_owner = False
         try:
+            await self._learn_own_user(ws)
             for event_type in SUBSCRIBED_EVENTS:
                 await self._cmd(ws, {"type": "subscribe_events", "event_type": event_type})
             await self._refresh_registries(ws)
@@ -289,6 +314,45 @@ class HAConnection:
         except Exception as exc:
             logger.error("HA post-connect setup failed: {}", exc)
             await ws.close()  # reader loop exits → _run marks unreachable + retries
+
+    async def _learn_own_user(self, ws: ClientConnection) -> None:
+        """Ask HA who this token belongs to, so changes made through it can be told apart.
+
+        Best effort, and fail closed: a failed lookup, or a reply that is not a dict, has no
+        string `id` or has an `is_owner` that is not a bool, logs one warning and leaves the
+        user unknown, which only means no change is ever marked as the service's own.
+        """
+        try:
+            result = await self._cmd(ws, {"type": "auth/current_user"})
+        except Exception as exc:
+            logger.warning(
+                "Could not learn this connection's HA user ({}: {}) — "
+                "its own changes will not be recognised",
+                type(exc).__name__,
+                exc,
+            )
+            return
+        reply = result if isinstance(result, dict) else {}
+        user_id, is_owner = reply.get("id"), reply.get("is_owner")
+        if not isinstance(user_id, str) or not isinstance(is_owner, bool):
+            logger.warning(
+                "HA's reply did not identify this connection's HA user — "
+                "its own changes will not be recognised"
+            )
+            return
+        self.user_id = user_id
+        self.is_owner = is_owner
+        name = reply.get("name")
+        logger.info(
+            "home-service is HA user {!r} ({})",
+            name if isinstance(name, str) else None,
+            "owner" if is_owner else "admin" if reply.get("is_admin") is True else "non-admin",
+        )
+        if is_owner:
+            logger.warning(
+                "home-service is using the Home Assistant owner's token, so its changes "
+                "cannot be told from the owner's own; it needs an HA user of its own"
+            )
 
     def _install_states(self, raw_states: Any) -> None:
         """Replace the states with get_states' reply, on the reader as its frame is handled.
@@ -360,13 +424,13 @@ class HAConnection:
                 event = msg.get("event") or {}
                 event_type = str(event.get("event_type", ""))
                 if event_type == "state_changed":
-                    await self._handle_state_changed(event.get("data") or {})
+                    await self._handle_state_changed(event.get("data") or {}, event.get("context"))
                 elif event_type.endswith("_registry_updated"):
                     self._schedule_registry_refresh()
             case _:
                 pass
 
-    async def _handle_state_changed(self, data: dict[str, Any]) -> None:
+    async def _handle_state_changed(self, data: dict[str, Any], event_context: Any) -> None:
         entity_id = str(data.get("entity_id", ""))
         if not entity_id:
             return
@@ -382,11 +446,57 @@ class HAConnection:
                 entity_id=entity_id, state=new_state or "unknown", attributes=attributes
             )
         self._last_event_monotonic = time.monotonic()
+        # HA sets the context on the event and on the new state; the event's is preferred.
+        # One that is not a dict, or has no string id, counts as absent, so it falls through
+        # to the other.
+        raw_context = next(
+            (
+                c
+                for c in (event_context, (new or {}).get("context"))
+                if isinstance(c, dict) and isinstance(c.get("id"), str)
+            ),
+            None,
+        )
+        context = self._build_context(raw_context)
         for cb in self._state_listeners:
             try:
-                await cb(entity_id, old_state, new_state, attributes)
+                await cb(entity_id, old_state, new_state, attributes, context)
             except Exception:
                 logger.exception("state listener failed for {}", entity_id)
+
+    def _build_context(self, raw: dict[str, Any] | None) -> HAContext | None:
+        """The listeners' view of an HA context; None when the event carried none.
+
+        A user_id or parent_id that is not a string reads as None. The caller only passes a
+        dict with a string id; anything else is absent and never gets here.
+        """
+        if raw is None:
+            return None
+        ctx_id, user_id, parent_id = (
+            v if isinstance(v, str) else None
+            for v in (raw.get("id"), raw.get("user_id"), raw.get("parent_id"))
+        )
+        return HAContext(
+            id=ctx_id,
+            user_id=user_id,
+            parent_id=parent_id,
+            person=self._person_for(user_id),
+            by_self=(
+                user_id is not None
+                and self.user_id is not None
+                and not self.is_owner
+                and user_id == self.user_id
+            ),
+        )
+
+    def _person_for(self, user_id: str | None) -> str | None:
+        """The person entity linked to this HA user, from the live states."""
+        if user_id is None:
+            return None
+        for entity_id, state in self.states.items():
+            if entity_id.startswith("person.") and state.attributes.get("user_id") == user_id:
+                return entity_id
+        return None
 
     # ── registry refresh (coalesced task — never run inside the reader loop) ──
 

@@ -18,7 +18,7 @@ from alfred_sdk.live_state import LiveStateWriter
 from loguru import logger
 
 from app.entity_index import EntityIndex
-from app.ha_connection import HAConnection, HAEntityState
+from app.ha_connection import HAConnection, HAContext, HAEntityState
 
 # Mirrors alfred_sdk.live_state.LiveStateKind, which mypy cannot see (alfred-sdk has no
 # py.typed); the writer validates the value at runtime either way.
@@ -148,6 +148,7 @@ class LiveStatePublisher:
         old_state: str | None,
         new_state: str | None,
         attributes: dict[str, Any],
+        context: HAContext | None,
     ) -> None:
         """HAConnection state listener; it applied the event to conn.states first.
 
