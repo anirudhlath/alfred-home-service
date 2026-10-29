@@ -86,6 +86,20 @@ async def test_dispatch_friendly_name_and_scene(
     assert stub.calls[-1] == ("scene", "turn_on", {}, ["scene.movie_night"])
 
 
+@pytest.mark.parametrize(
+    "target", ["Movie Night Script", "movie night script", "script.movie_night"]
+)
+async def test_dispatch_script_turn_on_resolves_a_script(
+    feature_env: tuple[HomeCapabilitiesFeature, StubHA, HomeCapabilitiesContext],
+    target: str,
+) -> None:
+    feature, stub, _ctx = feature_env
+    result = await feature._execute_by_name("home.script_turn_on", {"target": target})
+    assert result["status"] == "ok"
+    assert result["entity_ids"] == ["script.movie_night"]
+    assert stub.calls == [("script", "turn_on", {}, ["script.movie_night"])]
+
+
 async def test_call_service_escape_hatch(
     feature_env: tuple[HomeCapabilitiesFeature, StubHA, HomeCapabilitiesContext],
 ) -> None:

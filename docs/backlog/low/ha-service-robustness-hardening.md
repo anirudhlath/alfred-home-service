@@ -92,7 +92,7 @@ concurrent requests, or infrastructure hiccups. Track and fix opportunistically.
     disagree, or duplicate friendly names across areas) to lock in the documented
     precedence order.
   - `CapabilityGenerator`: no test asserting the `MAX_LISTED_ENTITIES` cap (30,
-    `app/capability_generator.py:27`) actually truncates `_target_description`'s
+    `app/capability_generator.py:30`) actually truncates `_target_description`'s
     entity list when a domain has more than 30 entities.
   - `CapabilityGenerator`: no negative audience assertions for `lock`/`cover` —
     existing tests assert what tools/risk *are* generated for these domains but

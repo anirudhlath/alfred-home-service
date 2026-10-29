@@ -65,25 +65,32 @@ def test_load_reflex_config() -> None:
 
 
 def test_reflex_domains_are_not_critical_in_the_risk_map() -> None:
-    """No REFLEX_DOMAINS member may be a critical domain in the shipped risk map.
+    """No REFLEX_DOMAINS member may be critical in the shipped risk map, by domain or device class.
 
     A reflex-tier tool takes its risk from the risk map, so an elevated domain
     (script) is fine: Reflex only asks the owner before running it. A critical
-    tool is different: Reflex refuses it even when the owner confirms, so a
-    critical domain in REFLEX_DOMAINS would ship a reflex tool that could only
-    ever fail. RiskMap exposes no public accessor for its domain sets, so this
-    reads the ACTUAL shipped config/risk_map.yaml and fails the moment a
-    REFLEX_DOMAINS member (or a lock, an alarm panel) turns up under
-    `critical.domains`.
+    tool is different: Alfred treats it as not askable, so Reflex can never ask
+    about it and a critical reflex tool would be a tool Reflex can only be
+    refused (System 2 can still run it after the owner confirms). RiskMap
+    exposes no public accessor for its lists, so this loads the ACTUAL shipped
+    config/risk_map.yaml, runs `risk_for` over every device class it lists (and
+    none) for each REFLEX_DOMAINS member, and fails the moment one is critical.
     """
-    raw: dict[str, Any] = yaml.safe_load((CONFIG_DIR / "risk_map.yaml").read_text()) or {}
-    critical_domains = set(raw.get("critical", {}).get("domains") or [])
+    path = CONFIG_DIR / "risk_map.yaml"
+    raw: dict[str, Any] = yaml.safe_load(path.read_text()) or {}
+    device_classes: list[str | None] = [None]
+    device_classes += [str(dc) for dc in raw.get("critical", {}).get("cover_device_classes") or []]
+    risk_map = RiskMap.load(path)
 
-    overlap = REFLEX_DOMAINS & critical_domains
-    assert not overlap, (
-        f"REFLEX_DOMAINS overlaps risk_map.yaml critical.domains: {sorted(overlap)}. "
-        "Reflex refuses a critical tool even when the owner confirms it, so a "
-        "reflex-tier tool over a critical domain could only fail. Either remove "
-        "the domain from risk_map.yaml's critical domains, or remove it from "
-        "REFLEX_DOMAINS in app/capability_generator.py."
+    critical = {
+        (domain, dc)
+        for domain in REFLEX_DOMAINS
+        for dc in device_classes
+        if risk_map.risk_for(domain, dc) == "critical"
+    }
+    assert not critical, (
+        f"REFLEX_DOMAINS has critical members in risk_map.yaml: {sorted(critical, key=str)}. "
+        "Alfred treats a critical tool as not askable, so Reflex could never ask about a "
+        "reflex-tier tool over it. Either take the domain out of the risk map's critical "
+        "lists, or remove it from REFLEX_DOMAINS in app/capability_generator.py."
     )

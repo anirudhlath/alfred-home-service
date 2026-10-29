@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from app.capability_generator import CapabilityGenerator, GeneratedToolSpec
+from app.capability_generator import REFLEX_DOMAINS, CapabilityGenerator, GeneratedToolSpec
 from app.entity_index import EntityIndex
 from app.ha_connection import HAEntityState
 from app.risk_map import RiskMap, load_reflex_config
@@ -126,17 +127,43 @@ def test_rest_of_an_elevated_reflex_domain_stays_conscious(
     assert "home.scene_turn_off" not in names
 
 
+def test_only_script_turn_on_differs_from_an_all_conscious_script_domain(
+    generator: CapabilityGenerator,
+    specs: list[GeneratedToolSpec],
+    built_index: EntityIndex,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pin the new tier against the old generator, where every script tool was conscious."""
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            "app.capability_generator.REFLEX_DOMAINS", REFLEX_DOMAINS - frozenset({"script"})
+        )
+        before = _by_name(generator.generate(DEFAULT_SERVICES, built_index))
+    after = _by_name(specs)
+    assert set(after) == set(before)
+    assert {n: s for n, s in after.items() if n != "home.script_turn_on"} == {
+        n: s for n, s in before.items() if n != "home.script_turn_on"
+    }
+    assert before["home.script_turn_on"].audience == "conscious"
+    assert [f.name for f in before["home.script_turn_on"].fields] == ["variables"]
+    assert after["home.script_turn_on"] == replace(
+        before["home.script_turn_on"], audience="reflex", fields=()
+    )
+
+
 def test_reflex_tier_is_not_specific_to_any_domain(
     built_index: EntityIndex, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A reflex domain's risk comes from the risk map: no domain is named in the rule."""
     monkeypatch.setattr("app.capability_generator.REFLEX_DOMAINS", frozenset({"climate"}))
     generator = CapabilityGenerator(
-        RiskMap.load(CONFIG_DIR / "risk_map.yaml"), {"climate": {"set_temperature": []}}
+        RiskMap.load(CONFIG_DIR / "risk_map.yaml"),
+        {"climate": {"set_temperature": ["temperature"]}},
     )
     by_name = _by_name(generator.generate(DEFAULT_SERVICES, built_index))
     set_temp = by_name["home.climate_set_temperature"]
-    assert (set_temp.audience, set_temp.risk, set_temp.fields) == ("reflex", "elevated", ())
+    assert (set_temp.audience, set_temp.risk) == ("reflex", "elevated")
+    assert [(f.name, f.type) for f in set_temp.fields] == [("temperature", "float")]
     set_mode = by_name["home.climate_set_hvac_mode"]
     assert (set_mode.audience, set_mode.risk) == ("conscious", "elevated")
     assert [f.name for f in set_mode.fields] == ["hvac_mode"]
