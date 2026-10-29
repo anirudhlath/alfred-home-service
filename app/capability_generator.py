@@ -130,17 +130,17 @@ class CapabilityGenerator:
             services: dict[str, Any] = catalog[domain] or {}
             if domain not in domains_present:
                 continue  # a service domain with no entities gets no tools
-            if domain not in REFLEX_DOMAINS:
-                specs.extend(self._conscious_specs(domain, services, index))
-                continue
             risk = self._risk_map.domain_tool_risk(domain, index)
+            if domain not in REFLEX_DOMAINS:
+                specs.extend(self._conscious_specs(domain, services, risk))
+                continue
             reflex = self._reflex_specs(domain, services, risk)
             specs.extend(reflex)
             if risk != "benign":
                 configured = {s.tool_name for s in reflex}
                 specs.extend(
                     s
-                    for s in self._conscious_specs(domain, services, index)
+                    for s in self._conscious_specs(domain, services, risk)
                     if s.tool_name not in configured
                 )
         specs.append(
@@ -189,9 +189,8 @@ class CapabilityGenerator:
         return specs
 
     def _conscious_specs(
-        self, domain: str, services: dict[str, Any], index: EntityIndex
+        self, domain: str, services: dict[str, Any], risk: Risk
     ) -> list[GeneratedToolSpec]:
-        risk = self._risk_map.domain_tool_risk(domain, index)
         specs: list[GeneratedToolSpec] = []
         for service in sorted(services):
             svc: dict[str, Any] = services[service] or {}

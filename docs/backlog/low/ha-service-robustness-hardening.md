@@ -98,8 +98,8 @@ concurrent requests, or infrastructure hiccups. Track and fix opportunistically.
     existing tests assert what tools/risk *are* generated for these domains but
     nothing asserts they are NOT tagged `audience="reflex"` (they're conscious-tier
     by construction since they're outside `REFLEX_DOMAINS`, but there's no test
-    pinning that down explicitly the way the disjointness test added in this
-    review pins down the risk side).
+    pinning that down explicitly the way
+    `test_reflex_domains_are_not_critical_in_the_risk_map` pins down the risk side).
   - `tests/fake_ha.py`: `_TARGET` (line 220, `_TARGET = {"entity": [{}]}`) has no
     type annotation — should be `_TARGET: dict[str, list[dict[str, Any]]] = {...}`
     for consistency with the rest of the module's typed module-level constants.

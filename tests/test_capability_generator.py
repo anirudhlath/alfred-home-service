@@ -114,7 +114,7 @@ def test_rest_of_an_elevated_reflex_domain_stays_conscious(
     ):
         assert by_name[name].audience == "conscious"
         assert by_name[name].risk == "elevated"
-    # a conscious tool keeps its targeted logic and every catalog field
+    # a conscious tool keeps its targeted logic
     assert by_name["home.script_turn_off"].targeted is True
     assert by_name["home.script_reload"].targeted is False
     assert by_name["home.script_movie_night"].targeted is False
