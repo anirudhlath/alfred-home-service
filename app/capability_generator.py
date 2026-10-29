@@ -3,6 +3,7 @@
 Crosses the HA service catalog (get_services) with the EntityIndex and emits
 SDK ToolMeta tagged with audience ("reflex" | "conscious") and risk
 ("benign" | "elevated" | "critical") per config/risk_map.yaml (contract C9).
+A reflex tool still carries its domain's risk: Reflex only asks before an elevated one.
 
 Live area/entity values are injected into parameter descriptions at manifest
 build time — the Reflex Engine renders parameter descriptions into its prompt
@@ -21,8 +22,10 @@ from app.risk_map import Risk, RiskMap
 
 Audience = Literal["reflex", "conscious"]
 
-# Contract C9 audience rule: tools over these domains → audience reflex, risk benign.
-REFLEX_DOMAINS = frozenset({"light", "switch", "media_player", "scene"})
+# Contract C9 audience rule: the services config/reflex_tools.yaml lists for these domains
+# → audience reflex, risk from the risk map. A domain above benign (script) keeps its
+# other services as conscious tools.
+REFLEX_DOMAINS = frozenset({"light", "switch", "media_player", "scene", "script"})
 
 MAX_LISTED_ENTITIES = 30  # cap injected entity lists to bound prompt size
 
@@ -127,10 +130,19 @@ class CapabilityGenerator:
             services: dict[str, Any] = catalog[domain] or {}
             if domain not in domains_present:
                 continue  # a service domain with no entities gets no tools
-            if domain in REFLEX_DOMAINS:
-                specs.extend(self._reflex_specs(domain, services))
-            else:
+            if domain not in REFLEX_DOMAINS:
                 specs.extend(self._conscious_specs(domain, services, index))
+                continue
+            risk = self._risk_map.domain_tool_risk(domain, index)
+            reflex = self._reflex_specs(domain, services, risk)
+            specs.extend(reflex)
+            if risk != "benign":
+                configured = {s.tool_name for s in reflex}
+                specs.extend(
+                    s
+                    for s in self._conscious_specs(domain, services, index)
+                    if s.tool_name not in configured
+                )
         specs.append(
             GeneratedToolSpec(
                 tool_name="home.call_service",
@@ -149,7 +161,9 @@ class CapabilityGenerator:
         )
         return specs
 
-    def _reflex_specs(self, domain: str, services: dict[str, Any]) -> list[GeneratedToolSpec]:
+    def _reflex_specs(
+        self, domain: str, services: dict[str, Any], risk: Risk
+    ) -> list[GeneratedToolSpec]:
         specs: list[GeneratedToolSpec] = []
         for service, extra_fields in self._reflex_config.get(domain, {}).items():
             svc = services.get(service)
@@ -167,7 +181,7 @@ class CapabilityGenerator:
                     service=service,
                     description=_service_description(svc, domain, service),
                     audience="reflex",
-                    risk="benign",  # contract C9 audience rule
+                    risk=risk,  # contract C9 audience rule: the domain's risk, not a constant
                     fields=fields,
                     targeted=True,
                 )

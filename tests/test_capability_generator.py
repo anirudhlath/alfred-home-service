@@ -46,7 +46,13 @@ def test_generated_tool_set_is_exactly_expected(specs: list[GeneratedToolSpec]) 
         "home.media_player_media_pause",
         "home.media_player_volume_set",
         "home.scene_turn_on",
-        # conscious tier (remaining domains with entities)
+        "home.script_turn_on",  # elevated: Reflex may only ask before running it
+        # conscious tier (remaining domains with entities, and the rest of an
+        # elevated reflex domain)
+        "home.script_turn_off",
+        "home.script_toggle",
+        "home.script_reload",
+        "home.script_movie_night",
         "home.climate_set_temperature",
         "home.climate_set_hvac_mode",
         "home.lock_lock",
@@ -70,6 +76,8 @@ def test_audience_and_risk_tagging(specs: list[GeneratedToolSpec]) -> None:
     ):
         assert by_name[name].audience == "reflex"
         assert by_name[name].risk == "benign"
+    assert by_name["home.script_turn_on"].audience == "reflex"
+    assert by_name["home.script_turn_on"].risk == "elevated"
     assert by_name["home.climate_set_temperature"].audience == "conscious"
     assert by_name["home.climate_set_temperature"].risk == "elevated"
     assert by_name["home.lock_unlock"].risk == "critical"
@@ -77,6 +85,61 @@ def test_audience_and_risk_tagging(specs: list[GeneratedToolSpec]) -> None:
     assert by_name["home.cover_close_cover"].risk == "critical"
     assert by_name["home.call_service"].audience == "conscious"
     assert by_name["home.call_service"].risk == "critical"
+
+
+def test_script_turn_on_is_a_reflex_tool_that_is_still_elevated(
+    generator: CapabilityGenerator, specs: list[GeneratedToolSpec], built_index: EntityIndex
+) -> None:
+    script_on = _by_name(specs)["home.script_turn_on"]
+    assert script_on.audience == "reflex"
+    assert script_on.risk == "elevated"
+    assert script_on.fields == ()  # the catalog's `variables` field is not offered to Reflex
+    assert script_on.targeted is True
+    assert _by_name(specs)["home.light_turn_on"].risk == "benign"
+    meta = generator.build_tool_meta(script_on, built_index)
+    assert (meta.audience, meta.risk) == ("reflex", "elevated")
+    assert set(meta.parameters) == {"target"}
+    assert "Movie Night Script" in meta.parameters["target"].description
+
+
+def test_rest_of_an_elevated_reflex_domain_stays_conscious(
+    generator: CapabilityGenerator, specs: list[GeneratedToolSpec], built_index: EntityIndex
+) -> None:
+    by_name = _by_name(specs)
+    for name in (
+        "home.script_turn_off",
+        "home.script_toggle",
+        "home.script_reload",
+        "home.script_movie_night",
+    ):
+        assert by_name[name].audience == "conscious"
+        assert by_name[name].risk == "elevated"
+    # a conscious tool keeps its targeted logic and every catalog field
+    assert by_name["home.script_turn_off"].targeted is True
+    assert by_name["home.script_reload"].targeted is False
+    assert by_name["home.script_movie_night"].targeted is False
+    # a service configured as a reflex tool is generated once, not again as a conscious one
+    names = [s.tool_name for s in specs]
+    assert len(names) == len(set(names))
+    # a benign reflex domain keeps only its compact tier
+    assert "home.light_toggle" not in names
+    assert "home.scene_turn_off" not in names
+
+
+def test_reflex_tier_is_not_specific_to_any_domain(
+    built_index: EntityIndex, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reflex domain's risk comes from the risk map: no domain is named in the rule."""
+    monkeypatch.setattr("app.capability_generator.REFLEX_DOMAINS", frozenset({"climate"}))
+    generator = CapabilityGenerator(
+        RiskMap.load(CONFIG_DIR / "risk_map.yaml"), {"climate": {"set_temperature": []}}
+    )
+    by_name = _by_name(generator.generate(DEFAULT_SERVICES, built_index))
+    set_temp = by_name["home.climate_set_temperature"]
+    assert (set_temp.audience, set_temp.risk, set_temp.fields) == ("reflex", "elevated", ())
+    set_mode = by_name["home.climate_set_hvac_mode"]
+    assert (set_mode.audience, set_mode.risk) == ("conscious", "elevated")
+    assert [f.name for f in set_mode.fields] == ["hvac_mode"]
 
 
 def test_reflex_tool_fields_are_compact(specs: list[GeneratedToolSpec]) -> None:

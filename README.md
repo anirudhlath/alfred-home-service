@@ -41,10 +41,14 @@ Built with FastAPI + websockets + aiomqtt, packaged with
    live; a NEW integration domain requires a service restart.
 3. **Generated capabilities** — `CapabilityGenerator` crosses the service
    catalog with discovered entities. Compact `audience: reflex` tools (lights,
-   switches, media players, scenes) carry live area/entity values in their
-   parameter descriptions; every other domain with entities gets
-   `audience: conscious` tools plus a generic `home.call_service` escape
-   hatch. Risk tiers come from `config/risk_map.yaml` (data, not code).
+   switches, media players, scenes, and `home.script_turn_on`) carry live
+   area/entity values in their parameter descriptions and take their risk from
+   `config/risk_map.yaml`: lights, switches, media players and scenes are
+   `benign`, a script is `elevated`, so Reflex may only ask before running one.
+   A reflex domain above `benign` keeps its other services as `conscious`
+   tools; every other domain with entities gets `audience: conscious` tools
+   plus a generic `home.call_service` escape hatch. Risk tiers come from
+   `config/risk_map.yaml` (data, not code).
 4. **State ingest** — every `state_changed` becomes a bus-schema
    `StateChangedEvent` published to MQTT `home/state_changed`. No HA-side
    automation is required anymore. Each event carries a `context` saying who

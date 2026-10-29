@@ -155,5 +155,7 @@ def test_to_manifest_propagates_audience_and_risk(
     tools = {t.name: t for t in manifest.tools}
     assert tools["home.light_turn_on"].audience == "reflex"
     assert tools["home.light_turn_on"].risk == "benign"
+    assert tools["home.script_turn_on"].audience == "reflex"
+    assert tools["home.script_turn_on"].risk == "elevated"
     assert tools["home.lock_unlock"].audience == "conscious"
     assert tools["home.lock_unlock"].risk == "critical"
