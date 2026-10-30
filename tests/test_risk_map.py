@@ -57,41 +57,40 @@ def test_domain_tool_risk_takes_max_over_entities() -> None:
 
 def test_load_reflex_config() -> None:
     config = load_reflex_config(CONFIG_DIR / "reflex_tools.yaml")
-    assert set(config) == {"light", "switch", "media_player", "scene"}
+    assert set(config) == {"light", "switch", "media_player", "scene", "script"}
     assert config["light"]["turn_on"] == ["brightness_pct"]
     assert config["light"]["turn_off"] == []
     assert config["media_player"]["volume_set"] == ["volume_level"]
+    assert config["script"] == {"turn_on": []}
 
 
-def test_reflex_domains_disjoint_from_risk_map_critical_and_elevated() -> None:
-    """Config-drift safety invariant (contract C9).
+def test_reflex_domains_are_not_critical_in_the_risk_map() -> None:
+    """No REFLEX_DOMAINS member may be critical in the shipped risk map, by domain or device class.
 
-    CapabilityGenerator hardcodes risk="benign" for every tool over a
-    REFLEX_DOMAINS domain (app/capability_generator.py `_reflex_specs`) — it
-    never consults RiskMap for those domains at all. That is safe ONLY as
-    long as no REFLEX_DOMAINS member also appears in the risk map's critical
-    or elevated domain lists. RiskMap exposes no public accessor for its
-    domain sets (by design — `risk_for`/`domain_tool_risk` are the only
-    public surface), so this test loads the ACTUAL shipped
-    config/risk_map.yaml directly to guard against that drift: if someone
-    later adds e.g. "switch" or "media_player" under critical/elevated
-    domains, a dangerous action would silently ship tagged reflex + benign,
-    bypassing the elevated/critical confirmation flow entirely. This test
-    MUST fail loudly the moment that happens.
+    A reflex-tier tool takes its risk from the risk map, so an elevated domain
+    (script) is fine: Reflex only asks the owner before running it. A critical
+    tool is different: Alfred treats it as not askable, so Reflex can never ask
+    about it and a critical reflex tool would be a tool Reflex can only be
+    refused (System 2 can still run it after the owner confirms). RiskMap
+    exposes no public accessor for its lists, so this loads the ACTUAL shipped
+    config/risk_map.yaml, runs `risk_for` over every device class it lists (and
+    none) for each REFLEX_DOMAINS member, and fails the moment one is critical.
     """
-    raw: dict[str, Any] = yaml.safe_load((CONFIG_DIR / "risk_map.yaml").read_text()) or {}
-    critical_domains = set(raw.get("critical", {}).get("domains") or [])
-    elevated_domains = set(raw.get("elevated", {}).get("domains") or [])
-    risky_domains = critical_domains | elevated_domains
+    path = CONFIG_DIR / "risk_map.yaml"
+    raw: dict[str, Any] = yaml.safe_load(path.read_text()) or {}
+    device_classes: list[str | None] = [None]
+    device_classes += [str(dc) for dc in raw.get("critical", {}).get("cover_device_classes") or []]
+    risk_map = RiskMap.load(path)
 
-    overlap = REFLEX_DOMAINS & risky_domains
-    assert not overlap, (
-        "REFLEX_DOMAINS overlaps risk_map.yaml critical/elevated domains: "
-        f"{sorted(overlap)}. CapabilityGenerator._reflex_specs() hardcodes "
-        "risk='benign' for every REFLEX_DOMAINS tool WITHOUT consulting "
-        "RiskMap, so any domain in this overlap would ship as a reflex-tier "
-        "benign tool despite being marked critical/elevated in "
-        "config/risk_map.yaml — a dangerous action bypassing confirmation. "
-        "Either remove the domain from risk_map.yaml's critical/elevated "
+    critical = {
+        (domain, dc)
+        for domain in REFLEX_DOMAINS
+        for dc in device_classes
+        if risk_map.risk_for(domain, dc) == "critical"
+    }
+    assert not critical, (
+        f"REFLEX_DOMAINS has critical members in risk_map.yaml: {sorted(critical, key=str)}. "
+        "Alfred treats a critical tool as not askable, so Reflex could never ask about a "
+        "reflex-tier tool over it. Either take the domain out of the risk map's critical "
         "lists, or remove it from REFLEX_DOMAINS in app/capability_generator.py."
     )

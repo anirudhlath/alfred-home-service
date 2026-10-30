@@ -92,15 +92,15 @@ concurrent requests, or infrastructure hiccups. Track and fix opportunistically.
     disagree, or duplicate friendly names across areas) to lock in the documented
     precedence order.
   - `CapabilityGenerator`: no test asserting the `MAX_LISTED_ENTITIES` cap (30,
-    `app/capability_generator.py:27`) actually truncates `_target_description`'s
+    `app/capability_generator.py:30`) actually truncates `_target_description`'s
     entity list when a domain has more than 30 entities.
   - `CapabilityGenerator`: no negative audience assertions for `lock`/`cover` —
     existing tests assert what tools/risk *are* generated for these domains but
     nothing asserts they are NOT tagged `audience="reflex"` (they're conscious-tier
     by construction since they're outside `REFLEX_DOMAINS`, but there's no test
-    pinning that down explicitly the way the disjointness test added in this
-    review pins down the risk side).
-  - `tests/fake_ha.py`: `_TARGET` (line 220, `_TARGET = {"entity": [{}]}`) has no
+    pinning that down explicitly the way
+    `test_reflex_domains_are_not_critical_in_the_risk_map` pins down the risk side).
+  - `tests/fake_ha.py`: `_TARGET` (line 236, `_TARGET = {"entity": [{}]}`) has no
     type annotation — should be `_TARGET: dict[str, list[dict[str, Any]]] = {...}`
     for consistency with the rest of the module's typed module-level constants.
 

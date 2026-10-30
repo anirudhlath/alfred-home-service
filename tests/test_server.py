@@ -79,7 +79,7 @@ async def test_credentials_endpoint_connects_and_returns_health(
     body = resp.json()
     assert body["status"] == "ok"
     assert body["health"]["ha"]["state"] == "connected"
-    assert body["health"]["ha"]["entities"] == 11
+    assert body["health"]["ha"]["entities"] == 12
     assert body["health"]["ha"]["areas"] == 3
 
 

@@ -191,6 +191,11 @@ DEFAULT_STATES: list[dict[str, Any]] = [
         "attributes": {"friendly_name": "Movie Night"},
     },
     {
+        "entity_id": "script.movie_night",
+        "state": "off",
+        "attributes": {"friendly_name": "Movie Night Script"},
+    },
+    {
         "entity_id": "climate.thermostat",
         "state": "heat",
         "attributes": {"friendly_name": "Thermostat", "current_temperature": 21.5},
@@ -339,6 +344,43 @@ DEFAULT_SERVICES: dict[str, Any] = {
             "description": "Activate a scene.",
             "fields": {},
             "target": _TARGET,
+        },
+    },
+    # HA serves the four generic script services plus one service per script.
+    "script": {
+        "turn_on": {
+            "name": "Turn on",
+            "description": "Run a script.",
+            "fields": {
+                "variables": {
+                    "name": "Variables",
+                    "description": "Variables to pass to the script.",
+                    "selector": {"object": None},
+                }
+            },
+            "target": _TARGET,
+        },
+        "turn_off": {
+            "name": "Turn off",
+            "description": "Stop a running script.",
+            "fields": {},
+            "target": _TARGET,
+        },
+        "toggle": {
+            "name": "Toggle",
+            "description": "Toggle a script.",
+            "fields": {},
+            "target": _TARGET,
+        },
+        "reload": {
+            "name": "Reload",
+            "description": "Reload all the scripts.",
+            "fields": {},
+        },
+        "movie_night": {
+            "name": "Movie Night Script",
+            "description": "Dim the lights and start the movie.",
+            "fields": {},
         },
     },
     "climate": {

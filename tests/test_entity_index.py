@@ -14,9 +14,10 @@ from tests.fake_ha import (
 
 
 def test_counts_and_disabled_exclusion(built_index: EntityIndex) -> None:
-    # 10 enabled registry entries ∪ 10 states = 11 unique
-    # (light.closet is registry-only, sensor.outdoor_temp is states-only)
-    assert built_index.entity_count() == 11
+    # 10 enabled registry entries ∪ 11 states = 12 unique
+    # (light.closet is registry-only, sensor.outdoor_temp and script.movie_night
+    # are states-only)
+    assert built_index.entity_count() == 12
     assert built_index.area_count() == 3
     assert built_index.get("light.disabled_lamp") is None
     assert built_index.get("sensor.outdoor_temp") is not None
@@ -29,6 +30,7 @@ def test_domains_and_area_names(built_index: EntityIndex) -> None:
         "switch",
         "media_player",
         "scene",
+        "script",
         "climate",
         "lock",
         "cover",
